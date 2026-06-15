@@ -1,0 +1,26 @@
+[package]
+name = "tohu"
+version = "0.0.0"
+edition = "2021"
+description = "Device identity for the TOKEN/FGTW app stack: per-platform device oracle + frozen v0 key derivation (handle → seed → vault path/key). The sign drawn from the formless."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nickspiker/tohu"
+readme = "README.md"
+keywords = ["identity", "device", "key-derivation", "vault", "fingerprint"]
+categories = ["cryptography", "no-std"]
+
+[dependencies]
+blake3 = { version = "1", default-features = false }
+unicode-normalization = { version = "0.1", default-features = false }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+
+# Android only: tohu reads the device oracle (Settings.Secure.ANDROID_ID) itself via JNI, using a JavaVM + Context the app hands it once through `android_init`. No network — auditable by inspection. Desktop builds never pull this.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
+[features]
+default = ["std"]
+std = ["blake3/std"]
+
+[dev-dependencies]
+hex = "0.4"
