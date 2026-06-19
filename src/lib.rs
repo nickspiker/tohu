@@ -83,26 +83,54 @@ const HEALTH_VERSION: u8 = 0;
 const HEALTH_FLAG_READY: u8 = 0b0000_0001;
 const HEALTH_FLAG_HARDWARE: u8 = 0b0000_0010;
 
-/// What a [`pipe`] health report decodes to. The software emulator reports the silicon as absent — "dead but responsive": no hardware, a single slot, no redundancy, zero rings online — yet `ready`, because the interface answers. Real PIPE fills these from the chip.
+/// Chip vitality on PIPE's two-bit redundancy scale (see ferros `GLOSSARY.md`), the value rising with attesting capability. NGARO — silent failure — has no code here: a NGARO chip does not transmit, so the caller infers it from [`pipe`] returning no response (`Err` / timeout), never from a decoded vector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ChipState {
+    /// KORE (`00`) — pre-provisioning void: no *ira* burned, no identity.
+    Kore = 0b00,
+    /// WHARA (`01`) — two redundancy pairs valid, two invalid: minimum byzantine quorum.
+    Whara = 0b01,
+    /// HARA (`10`) — three pairs valid, one invalid: single-fault tolerated.
+    Hara = 0b10,
+    /// ORA (`11`) — all four pairs valid: fully operational. Software emulation reports ORA with `hardware: false` — operational, but no silicon redundancy (see `slots` / `rings_online`).
+    Ora = 0b11,
+}
+
+impl ChipState {
+    fn from_code(code: u8) -> Self {
+        match code & 0b11 {
+            0b00 => ChipState::Kore,
+            0b01 => ChipState::Whara,
+            0b10 => ChipState::Hara,
+            _ => ChipState::Ora,
+        }
+    }
+}
+
+/// What a [`pipe`] health report decodes to. The software emulator reports the silicon as absent — "operational but emulated": [`ChipState::Ora`] (it answers attestations) yet `hardware: false`, a single slot, no redundancy, zero rings online. Real PIPE fills these from the chip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HealthState {
-    /// The pipe is responsive and will answer attestations.
+    /// The pipe is responsive and will answer attestations. `false` paired with no wire response is NGARO (see [`ChipState`]).
     pub ready: bool,
     /// `true` = backed by real PIPE silicon; `false` = software emulation (tohu). This is the bit an app keys its "Security" posture on: hardware root vs software root.
     pub hardware: bool,
+    /// The chip's vitality on the [`ChipState`] scale. Software emulation reports [`ChipState::Ora`].
+    pub state: ChipState,
     /// Redundancy slots: 1 in software; the chip's slot count in hardware.
     pub slots: u8,
     /// Rings currently online: 0 in software (no rings); the chip's live-ring count in hardware.
     pub rings_online: u8,
 }
 
-/// The emulated software health vector — a fixed 32-byte packed state ([`decode_health`] reads it back). Identical on every software install: it describes the *kind* of pipe (software, ready, no hardware), never the device. Real PIPE returns its own chip-specific vector instead.
+/// The emulated software health vector — a fixed 32-byte packed state ([`decode_health`] reads it back), the same layout real PIPE fills from the chip. Byte 0 is the version; byte 1 the flags (READY, HARDWARE); byte 2 the slot count; byte 3 the live-ring count; byte 4 the [`ChipState`] code. Identical on every software install: it describes the *kind* of pipe (software, ready, ORA-but-emulated), never the device.
 pub fn health_vector() -> [u8; 32] {
     let mut v = [0u8; 32];
     v[0] = HEALTH_VERSION;
     v[1] = HEALTH_FLAG_READY; // ready; hardware bit clear = software emulation
     v[2] = 1; // one slot
     v[3] = 0; // zero rings online
+    v[4] = ChipState::Ora as u8; // operational (no silicon redundancy; hardware bit clear says so)
     v
 }
 
@@ -111,6 +139,7 @@ pub fn decode_health(resp: &[u8; 32]) -> HealthState {
     HealthState {
         ready: resp[1] & HEALTH_FLAG_READY != 0,
         hardware: resp[1] & HEALTH_FLAG_HARDWARE != 0,
+        state: ChipState::from_code(resp[4]),
         slots: resp[2],
         rings_online: resp[3],
     }
@@ -125,6 +154,84 @@ pub fn pipe(challenge: &[u8; 32]) -> std::io::Result<[u8; 32]> {
         return Ok(health_vector());
     }
     Ok(attest_with(challenge, &device::device_secret()?))
+}
+
+// ── Session handle — the device's one handle, shared in RAM (std) ─────────────────────────
+//
+// The SESSION backend from `docs/handle.md`: the device's single identity, held in the per-login RAM-backed runtime dir so every app the user runs reads the same one, it survives an app restart, and it dies at logout — never on durable disk.
+//
+// It stores fixed-size DERIVED ROOTS, never the handle string. The string is variable-length (no register holds it) and the user's plaintext handle need never live anywhere; an app computes the roots from the typed handle once, at first attest, and drops the string. See [`SessionIdentity`].
+//
+// First cut: an `$XDG_RUNTIME_DIR` (tmpfs) file — shared across the user's session, gone at logout. Honest wart: tmpfs can swap, so it's RAM-but-not-swap-proof; the swap-resistant upgrade is the kernel session keyring (no daemon). There is deliberately no agent daemon — on a shared-UID OS a daemon adds nothing over the keyring (a same-UID process reads either), and hardware (PIPE) is the only same-UID-proof store. Non-unix falls back to the temp dir (functional, not RAM) until each platform's native session store lands.
+
+/// The device's session identity — fixed-size derived roots, register-shaped. The handle string is never stored: it is variable-length (no register would hold it) and the plaintext need not exist outside the moment of first attest. All three are 256-bit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct SessionIdentity {
+    /// The network/contacts/avatar root — the app's pre-PoW handle hash (e.g. `ihi::handle_to_hash`). Secret.
+    pub identity_seed: [u8; 32],
+    /// The local-vault root — [`handle_seed`], kept on a SEPARATE pre-image from `identity_seed` so a `handle_proof` observed on the wire has no derivation path (not even one-way) to the vault key. Secret.
+    pub vault_seed: [u8; 32],
+    /// The public memory-hard proof (`spaghettify(identity_seed)`). Safe on the wire; cached here so resume skips the ~1s recompute.
+    pub handle_proof: [u8; 32],
+}
+
+/// The device's remembered session identity for this login, or `None` (first run, after logout, or [`clear_session`]). Every app the user runs reads this, so they share one identity without each re-prompting — and without the handle string ever touching the store.
+#[cfg(feature = "std")]
+pub fn session() -> Option<SessionIdentity> {
+    let bytes = std::fs::read(session_path()?).ok()?;
+    if bytes.len() != 96 {
+        return None;
+    }
+    let mut s = SessionIdentity::default();
+    s.identity_seed.copy_from_slice(&bytes[0..32]);
+    s.vault_seed.copy_from_slice(&bytes[32..64]);
+    s.handle_proof.copy_from_slice(&bytes[64..96]);
+    Some(s)
+}
+
+/// Remember the session identity (RAM, `0600` on unix, gone at logout). Overwrites any prior value. Writes the three roots as 96 raw bytes — no handle string.
+#[cfg(feature = "std")]
+pub fn set_session(s: &SessionIdentity) -> std::io::Result<()> {
+    use std::io::Write;
+    let path = session_path()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no session runtime dir"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&path)?;
+    f.write_all(&s.identity_seed)?;
+    f.write_all(&s.vault_seed)?;
+    f.write_all(&s.handle_proof)
+}
+
+/// Forget the session identity (logout / drop). The runtime dir is wiped by the OS at logout regardless.
+#[cfg(feature = "std")]
+pub fn clear_session() {
+    if let Some(p) = session_path() {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[cfg(feature = "std")]
+fn session_path() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| {
+            let user = std::env::var("USER")
+                .or_else(|_| std::env::var("USERNAME"))
+                .unwrap_or_else(|_| String::from("user"));
+            std::env::temp_dir().join(format!("tohu-{user}"))
+        });
+    Some(base.join("tohu").join("session"))
 }
 
 fn derive_context(role: &str, app_id: &str) -> String {
@@ -390,7 +497,7 @@ mod tests {
         );
         assert_eq!(
             hex::encode(health_vector()),
-            "0001010000000000000000000000000000000000000000000000000000000000",
+            "0001010003000000000000000000000000000000000000000000000000000000",
             "health_vector shifted",
         );
     }
@@ -400,6 +507,7 @@ mod tests {
         let h = decode_health(&health_vector());
         assert!(h.ready, "emulator is responsive");
         assert!(!h.hardware, "emulator must report NO hardware (drives Security posture)");
+        assert_eq!(h.state, ChipState::Ora, "software emulation is operational (ORA), no silicon redundancy");
         assert_eq!(h.slots, 1, "software is a single slot");
         assert_eq!(h.rings_online, 0, "software has zero rings online");
     }

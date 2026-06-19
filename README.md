@@ -1,3 +1,5 @@
+![tohu](tohu.webp)
+
 # tohu
 
 **Device identity for the passless app stack.**
@@ -92,6 +94,12 @@ let health = tohu::decode_health(&tohu::pipe(&tohu::HEALTH_CHALLENGE)?);
 
 ---
 
+## The handle (design)
+
+`handle_seed(handle)` takes the handle as input but never says where it comes from or how every app on the device agrees on one. That gap — **one handle per device** (anti-sybil, keyed by `device_secret`), entered once and broadcast to every app via `tohu::handle()`, persisted to a device-encrypted slot or held session-only in the best volatile store each platform offers — is designed in [docs/handle.md](docs/handle.md). It's new `std` surface only; the frozen `v0` derivations are untouched.
+
+---
+
 ## Uniqueness
 
 `device_secret` carries exactly the oracle's entropy. `ANDROID_ID` is 64-bit, so an accidental two-device collision is birthday-bound at ~5 billion installs (`√(2·2⁶⁴·ln 2)`) — more than every Android device on Earth, and well past where hardware identity supersedes this oracle. And the provided derivations (`vault_path_name` / `vault_anchor_key`) fold `handle_seed` in regardless, so identities separate by handle even then. Not a concern at realistic scale; the collision-free root is hardware.
@@ -101,6 +109,18 @@ let health = tohu::decode_health(&tohu::pipe(&tohu::HEALTH_CHALLENGE)?);
 ## Status
 
 `v0` — the derivation primitives are frozen (a snapshot test guards them: if any output shifts, every existing vault on every device becomes unreachable). The device oracle is an interim; the endgame is a hardware identity device, slotted in behind the same `device_secret` boundary with no change to callers.
+
+## Terminology
+
+tohu is the software stand-in for PIPE's silicon identity, so it speaks the same vocabulary (full cross-stack glossary: `GLOSSARY.md` in the ferros repo).
+
+- ***ira*** — the permanent device identity. In hardware the *ira* is begotten by the *whakaira* ceremony and burned write-once; here `device_secret` (`BLAKE3(machine_fingerprint())`) is its software stand-in — the same 32 bytes feed the same downstream derivation.
+- ***wairua*** — the per-session secret. PIPE draws it from fresh entropy into a volatile register; tohu has none of its own yet (the handle session store is a separate, documented RAM exception).
+- ***whakaira*** — the owner-initiated genesis ceremony that begets the *ira* (PIPE only; tohu derives `device_secret` from the platform oracle instead).
+- **`pipe`** — the bitwise 256-in / 256-out interface mirroring the PIPE wire: the all-zeros `HEALTH_CHALLENGE` returns a `HealthState`, any other challenge attests.
+- **`ChipState`** — chip vitality on PIPE's two-bit scale: KORE (`00`, void) · WHARA (`01`, min quorum) · HARA (`10`, single-fault) · ORA (`11`, operational). NGARO (silent failure) is inferred from no response. Software emulation reports ORA with `hardware: false`.
+
+---
 
 ## License
 
