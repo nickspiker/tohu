@@ -8,7 +8,7 @@
 //!
 //! ```text
 //!   handle (plaintext String, any Unicode)
-//!     │  NFC normalize → BLAKE3
+//!     │  VSF x encode (NFC + full-codespace Huffman) → BLAKE3
 //!     ▼
 //!   handle_seed (32 bytes)
 //!     │
@@ -23,17 +23,16 @@
 extern crate alloc;
 
 use alloc::string::String;
-use unicode_normalization::UnicodeNormalization;
 
 /// Frozen version suffix. Every context string in this crate ends with this. Bumping to `v1` means a coordinated migration across all stack apps.
 pub const VERSION: &str = "v0";
 
-/// Cheap, deterministic 32-byte seed derived from a handle string. NFC-normalized so `café` (precomposed) and `cafe\u{0301}` (decomposed) collapse to the same bytes. Unicode's stability policy guarantees NFC output for already-assigned codepoints never changes across Unicode versions.
+/// Cheap, deterministic 32-byte seed derived from a handle string. VSF x-encodes the handle (NFC normalization + full-codespace Huffman) then BLAKE3-hashes the resulting bytes — identical canonicalization to `ihi::handle_to_hash`, so vault_seed and identity_seed share one pre-image contract. The VSF frozen encoder lane (vsf "0.6") is pinned so the byte stream can never shift under this derivation.
 ///
 /// **Not** the public network identity — that's `handle_proof` (the memory-hard PoW). This is the cheap derivation root for local material only.
 pub fn handle_seed(handle: &str) -> [u8; 32] {
-    let nfc: String = handle.nfc().collect();
-    *blake3::hash(nfc.as_bytes()).as_bytes()
+    let vsf_bytes = vsf::types::VsfType::x(String::from(handle)).flatten();
+    *blake3::hash(&vsf_bytes).as_bytes()
 }
 
 /// Per-app per-handle per-device opaque vault filename. Output is a 43-character base64url string (no padding). `app_id` is a constant string the calling app embeds at build time (e.g. `"photon"`, `"lumis"`).
@@ -477,17 +476,17 @@ mod tests {
 
         assert_eq!(
             hex::encode(seed),
-            "71b278f3dc434447fc620500e47b6a80b0cb0df76a1051119fe19ed4953242df",
+            "e450d4112116ee2d7ee2388cfcf1b4ad39399be7e31b57839be0d9a8de0dbdde",
             "handle_seed(\"alice\") shifted",
         );
         assert_eq!(
             vault_path_name("photon", &seed, &device),
-            "r-R22un7yMmlmVGz-98KQLGGqvMiuaMFOqqMcktcpxI",
+            "ak2ZJo3J5u7LII8RDplU-jmascCgevi5T24GvYvBW-Q",
             "vault_path_name shifted",
         );
         assert_eq!(
             hex::encode(vault_anchor_key("photon", &seed, &device)),
-            "60489631c17293044873bd9f6cfcbb1dfef5250263d7ceea7ea0d8552fb7a2a3",
+            "af52ecc6d9883732bacfcc9114a5938dd2d8e117fdcba037c8c3d500787b218f",
             "vault_anchor_key shifted",
         );
         assert_eq!(
