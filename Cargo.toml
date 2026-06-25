@@ -1,6 +1,6 @@
 [package]
 name = "tohu"
-version = "0.0.0"
+version = "0.0.1"
 edition = "2021"
 description = "Device identity for the TOKEN/FGTW app stack: per-platform device oracle + frozen v0 key derivation (handle → seed → vault path/key). The sign drawn from the formless."
 license = "MIT OR Apache-2.0"
