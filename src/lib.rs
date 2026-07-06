@@ -177,6 +177,18 @@ pub struct SessionIdentity {
 /// The device's remembered session identity for this login, or `None` (first run, after logout, or [`clear_session`]). Every app the user runs reads this, so they share one identity without each re-prompting — and without the handle string ever touching the store.
 #[cfg(feature = "std")]
 pub fn session() -> Option<SessionIdentity> {
+    // Android (session dirs set): the boot-locked capsule in the local file tiers — survives an app restart on every device (the tmpfs path below is wiped on Android), dies on reboot via the wairua. Try each tier; first that opens under the current wairua wins.
+    if let Some(paths) = session_capsule_paths() {
+        for p in paths {
+            if let Ok(bytes) = std::fs::read(&p) {
+                if let Some(s) = open_session(&bytes, SealMode::Local) {
+                    return Some(s);
+                }
+            }
+        }
+        return None;
+    }
+    // Desktop: the raw 96 bytes in the XDG_RUNTIME_DIR tmpfs, which already dies at logout/reboot.
     let bytes = std::fs::read(session_path()?).ok()?;
     if bytes.len() != 96 {
         return None;
@@ -192,6 +204,28 @@ pub fn session() -> Option<SessionIdentity> {
 #[cfg(feature = "std")]
 pub fn set_session(s: &SessionIdentity) -> std::io::Result<()> {
     use std::io::Write;
+    // Android (session dirs set): seal the boot-locked capsule and write it to every local file tier — the primary (filesDir) is authoritative and must succeed; the shadow is best-effort.
+    if let Some(paths) = session_capsule_paths() {
+        let cap = seal_session(s, SealMode::Local).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "no wairua to seal the session")
+        })?;
+        let mut iter = paths.iter();
+        let primary = iter
+            .next()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no session dir"))?;
+        if let Some(parent) = primary.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_private(primary, &cap)?;
+        for shadow in iter {
+            if let Some(parent) = shadow.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = write_private(shadow, &cap);
+        }
+        return Ok(());
+    }
+    // Desktop: the raw 96 bytes to the XDG_RUNTIME_DIR tmpfs.
     let path = session_path()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no session runtime dir"))?;
     if let Some(parent) = path.parent() {
@@ -213,6 +247,12 @@ pub fn set_session(s: &SessionIdentity) -> std::io::Result<()> {
 /// Forget the session identity (logout / drop). The runtime dir is wiped by the OS at logout regardless.
 #[cfg(feature = "std")]
 pub fn clear_session() {
+    if let Some(paths) = session_capsule_paths() {
+        for p in paths {
+            let _ = std::fs::remove_file(p);
+        }
+        return;
+    }
     if let Some(p) = session_path() {
         let _ = std::fs::remove_file(p);
     }
@@ -231,6 +271,314 @@ fn session_path() -> Option<std::path::PathBuf> {
             std::env::temp_dir().join(format!("tohu-{user}"))
         });
     Some(base.join("tohu").join("session"))
+}
+
+// ============================================================================ Boot-locked session capsule ================================================
+//
+// The Android session that survives an app restart but dies on reboot, without a durable-disk secret or a (Samsung-flaky) sticky broadcast holding the raw roots.
+// The 96-byte SessionIdentity is sealed under the *wairua* — a per-boot key derived from `/proc/sys/kernel/random/boot_id`, which is fresh each boot and gone on reboot — so the same boot decrypts it (seamless restart) while a reboot's fresh boot_id leaves it undecryptable (re-attest).
+// The capsule is inert boot-locked ciphertext, so photon can write it to every storage tier (app-private for restart, sticky broadcast / SAF for reinstall) and just try each on launch; the crypto, not the storage location, enforces "dies on reboot".
+// See photon's docs/android-session-persistence.md for the tier list and flows; this module owns only the capsule crypto and the wairua.
+
+/// Which secret the *wairua* binds to.
+/// `Local` (filesDir, external shadow) is sandbox/FBE-protected, so the public `boot_id` alone is enough.
+/// `Shared` (sticky broadcast, SAF) can outlive the app and be more exposed, so it folds in `device_secret` (the app-private ANDROID_ID root) and carries a `device_secret` MAC — a leaked capsule then can't be opened or forged without the device.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SealMode {
+    Local,
+    Shared,
+}
+
+/// 8-byte capsule magic; the trailing digit is the format version, so a future format bump (`TOHUSES2`) makes old capsules fall through to `None` → attest, with no backward-compat path (pre-public; nuke-and-restart).
+///
+/// INTERIM FORMAT — the envelope (`MAGIC ‖ mode ‖ [MAC] ‖ nonce ‖ ct+tag`) is a plain versioned binary, fine for testing but NOT final: before finalization the capsule MUST become a full spec-compliant VSF document (for tooling/self-description/forward-compat reasons).
+/// The whole format is contained in `seal_session`/`open_session` and callers only pass opaque bytes, so that swap is localized here and touches nothing built on top.
+const CAPSULE_MAGIC: &[u8; 8] = b"TOHUSES1";
+
+#[cfg(feature = "std")]
+static BOOT_SECRET_OVERRIDE: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+
+/// Fallback boot-secret source for ROMs whose SELinux policy blocks reading `/proc/sys/kernel/random/boot_id` from the `untrusted_app` domain.
+/// The platform layer hands in a per-boot value (the boot_id read in Kotlin, or a random 32-byte secret held in the sticky broadcast for the boot) and it overrides the `/proc` read for the rest of the process.
+/// On-device probing (2026-07-06) found the direct read works, so this is a dormant safety valve, not the primary path.
+#[cfg(feature = "std")]
+pub fn set_boot_secret_override(secret: &[u8]) {
+    *BOOT_SECRET_OVERRIDE.lock().unwrap() = Some(secret.to_vec());
+}
+
+/// Local-tier capsule filename, placed under each session dir.
+const CAPSULE_FILE: &str = "tohu.session.cap";
+
+#[cfg(feature = "std")]
+static SESSION_DIRS: std::sync::Mutex<Option<(std::path::PathBuf, Option<std::path::PathBuf>)>> =
+    std::sync::Mutex::new(None);
+
+/// Point the local session tiers at the app's storage dirs (Android: `filesDir` primary + external shadow, handed in from JNI).
+/// Once set, `session`/`set_session`/`clear_session` store the boot-locked capsule here instead of the desktop tmpfs path — which is what makes an app restart survive on Android (`filesDir` persists across restart on every device; the tmpfs fallback did not).
+/// Desktop never calls this, so it stays on the tmpfs path.
+#[cfg(feature = "std")]
+pub fn set_session_dir(primary: &std::path::Path, shadow: Option<&std::path::Path>) {
+    *SESSION_DIRS.lock().unwrap() =
+        Some((primary.to_path_buf(), shadow.map(|p| p.to_path_buf())));
+}
+
+/// The capsule file path(s) — primary first, then shadow — or `None` on desktop (no dirs set → the tmpfs path is used instead).
+#[cfg(feature = "std")]
+fn session_capsule_paths() -> Option<Vec<std::path::PathBuf>> {
+    let (primary, shadow) = SESSION_DIRS.lock().unwrap().clone()?;
+    let mut v = vec![primary.join(CAPSULE_FILE)];
+    if let Some(sh) = shadow {
+        v.push(sh.join(CAPSULE_FILE));
+    }
+    Some(v)
+}
+
+/// Write `bytes` to `path`, truncating, `0600` on unix.
+#[cfg(feature = "std")]
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(bytes)
+}
+
+/// The per-boot secret: the override if one was set, else the trimmed `/proc/sys/kernel/random/boot_id` UUID string bytes (fed straight into the derivation — it is a KDF input, no hex-parse needed).
+/// `None` only when neither source is available (non-Linux, or a blocked `/proc` with no override set).
+#[cfg(feature = "std")]
+fn boot_secret() -> Option<Vec<u8>> {
+    if let Some(o) = BOOT_SECRET_OVERRIDE.lock().unwrap().clone() {
+        return Some(o);
+    }
+    let raw = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.as_bytes().to_vec())
+}
+
+/// The *wairua* — the per-boot key the capsule is sealed under.
+/// `ihi::spaghettify` (fast, ~ms) of a domain tag ‖ the boot secret, plus `device_secret` for `Shared`.
+/// Dies on reboot because the boot secret does; `None` if there is no boot-secret source (or, for `Shared`, no `device_secret`).
+#[cfg(feature = "std")]
+fn wairua(mode: SealMode) -> Option<[u8; 32]> {
+    let boot = boot_secret()?;
+    let mut input = Vec::with_capacity(16 + boot.len() + 32);
+    input.extend_from_slice(b"tohu-wairua-v0:");
+    input.extend_from_slice(&boot);
+    if mode == SealMode::Shared {
+        input.extend_from_slice(&crate::device::device_secret().ok()?);
+    }
+    Some(ihi::spaghettify(&input))
+}
+
+/// Seal the 96-byte session roots (`identity_seed ‖ vault_seed ‖ handle_proof`, proof included so a same-boot resume skips the ~1s recompute) into a boot-locked capsule.
+/// Layout: `MAGIC(8) ‖ mode(1) ‖ [device_secret MAC(32) if Shared] ‖ nonce(12) ‖ ct+tag`.
+/// `None` if the *wairua* (or, for `Shared`, `device_secret`) is unavailable.
+#[cfg(feature = "std")]
+pub fn seal_session(s: &SessionIdentity, mode: SealMode) -> Option<Vec<u8>> {
+    use chacha20poly1305::{
+        ChaCha20Poly1305, Nonce,
+        aead::{Aead, KeyInit},
+    };
+    use rand::RngCore;
+
+    let key = wairua(mode)?;
+    let mut roots = [0u8; 96];
+    roots[0..32].copy_from_slice(&s.identity_seed);
+    roots[32..64].copy_from_slice(&s.vault_seed);
+    roots[64..96].copy_from_slice(&s.handle_proof);
+
+    let cipher = ChaCha20Poly1305::new((&key).into());
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let ct = cipher.encrypt(&Nonce::from(nonce_bytes), roots.as_ref()).ok();
+    roots.iter_mut().for_each(|b| *b = 0); // don't leave plaintext roots in the stack buffer
+    let ct = ct?;
+
+    let mut blob = Vec::with_capacity(12 + ct.len());
+    blob.extend_from_slice(&nonce_bytes);
+    blob.extend_from_slice(&ct);
+
+    let mut out = Vec::with_capacity(8 + 1 + 32 + blob.len());
+    out.extend_from_slice(CAPSULE_MAGIC);
+    out.push(mode as u8);
+    if mode == SealMode::Shared {
+        let ds = crate::device::device_secret().ok()?;
+        out.extend_from_slice(blake3::keyed_hash(&ds, &blob).as_bytes());
+    }
+    out.extend_from_slice(&blob);
+    Some(out)
+}
+
+/// Open a capsule sealed by [`seal_session`] under the current *wairua*.
+/// `None` on any failure — bad magic/version, mode mismatch, `device_secret` MAC mismatch (`Shared`), or AEAD auth failure (a wrong *wairua* = reboot, or tamper, or corruption) — so the caller's existing "`None` → attest" path fires untouched.
+#[cfg(feature = "std")]
+pub fn open_session(bytes: &[u8], mode: SealMode) -> Option<SessionIdentity> {
+    use chacha20poly1305::{
+        ChaCha20Poly1305, Nonce,
+        aead::{Aead, KeyInit},
+    };
+
+    if bytes.len() < 9 || &bytes[0..8] != CAPSULE_MAGIC || bytes[8] != mode as u8 {
+        return None;
+    }
+    let body = &bytes[9..];
+
+    let blob = if mode == SealMode::Shared {
+        if body.len() < 32 {
+            return None;
+        }
+        let (mac, blob) = body.split_at(32);
+        let ds = crate::device::device_secret().ok()?;
+        let mac_arr: [u8; 32] = mac.try_into().ok()?;
+        // blake3::Hash's PartialEq is constant-time.
+        if blake3::Hash::from(mac_arr) != blake3::keyed_hash(&ds, blob) {
+            return None;
+        }
+        blob
+    } else {
+        body
+    };
+
+    if blob.len() < 12 + 16 {
+        return None;
+    }
+    let (nonce_bytes, ct) = blob.split_at(12);
+    let key = wairua(mode)?;
+    let cipher = ChaCha20Poly1305::new((&key).into());
+    let nonce = Nonce::try_from(nonce_bytes).ok()?;
+    let pt = cipher.decrypt(&nonce, ct).ok()?;
+    if pt.len() != 96 {
+        return None;
+    }
+    let mut out = SessionIdentity::default();
+    out.identity_seed.copy_from_slice(&pt[0..32]);
+    out.vault_seed.copy_from_slice(&pt[32..64]);
+    out.handle_proof.copy_from_slice(&pt[64..96]);
+    Some(out)
+}
+
+#[cfg(all(test, feature = "std"))]
+mod capsule_tests {
+    use super::*;
+
+    // The wairua override is process-global, so serialize the tests that set it.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn sample() -> SessionIdentity {
+        SessionIdentity {
+            identity_seed: [1u8; 32],
+            vault_seed: [2u8; 32],
+            handle_proof: [3u8; 32],
+        }
+    }
+
+    #[test]
+    fn local_round_trips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        set_boot_secret_override(b"boot-A");
+        let cap = seal_session(&sample(), SealMode::Local).expect("seal");
+        assert_eq!(open_session(&cap, SealMode::Local).expect("open"), sample());
+    }
+
+    #[test]
+    fn shared_round_trips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        set_boot_secret_override(b"boot-A");
+        let cap = seal_session(&sample(), SealMode::Shared).expect("seal");
+        assert_eq!(open_session(&cap, SealMode::Shared).expect("open"), sample());
+    }
+
+    #[test]
+    fn wrong_wairua_fails() {
+        // A reboot changes the boot secret → the old capsule must not open.
+        let _g = TEST_LOCK.lock().unwrap();
+        set_boot_secret_override(b"boot-A");
+        let cap = seal_session(&sample(), SealMode::Local).expect("seal");
+        set_boot_secret_override(b"boot-B");
+        assert!(open_session(&cap, SealMode::Local).is_none());
+    }
+
+    #[test]
+    fn tampered_shared_fails() {
+        let _g = TEST_LOCK.lock().unwrap();
+        set_boot_secret_override(b"boot-A");
+        let mut cap = seal_session(&sample(), SealMode::Shared).expect("seal");
+        let n = cap.len();
+        cap[n - 1] ^= 0xff; // flip a ciphertext byte
+        assert!(open_session(&cap, SealMode::Shared).is_none());
+    }
+
+    #[test]
+    fn bad_magic_fails() {
+        let _g = TEST_LOCK.lock().unwrap();
+        set_boot_secret_override(b"boot-A");
+        let mut cap = seal_session(&sample(), SealMode::Local).expect("seal");
+        cap[0] ^= 0xff;
+        assert!(open_session(&cap, SealMode::Local).is_none());
+    }
+
+    #[test]
+    fn mode_mismatch_fails() {
+        let _g = TEST_LOCK.lock().unwrap();
+        set_boot_secret_override(b"boot-A");
+        let cap = seal_session(&sample(), SealMode::Local).expect("seal");
+        assert!(open_session(&cap, SealMode::Shared).is_none());
+    }
+
+    // Through the actual session()/set_session() file-tier path (the Android local tiers).
+    #[test]
+    fn session_dir_round_trips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        set_boot_secret_override(b"boot-A");
+        let dir = std::env::temp_dir().join("tohu-step2-roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        set_session_dir(&dir, None);
+        set_session(&sample()).expect("set_session");
+        assert_eq!(session().expect("session"), sample());
+        clear_session();
+        assert!(session().is_none());
+        *SESSION_DIRS.lock().unwrap() = None; // restore global state for the desktop-path tests
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_dir_reboot_de_attests() {
+        let _g = TEST_LOCK.lock().unwrap();
+        set_boot_secret_override(b"boot-A");
+        let dir = std::env::temp_dir().join("tohu-step2-reboot");
+        let _ = std::fs::remove_dir_all(&dir);
+        set_session_dir(&dir, None);
+        set_session(&sample()).expect("set_session");
+        set_boot_secret_override(b"boot-B"); // reboot → fresh boot_id
+        assert!(
+            session().is_none(),
+            "capsule on disk must be undecryptable after a reboot"
+        );
+        *SESSION_DIRS.lock().unwrap() = None;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_dir_shadow_fallback() {
+        let _g = TEST_LOCK.lock().unwrap();
+        set_boot_secret_override(b"boot-A");
+        let base = std::env::temp_dir().join("tohu-step2-shadow");
+        let (primary, shadow) = (base.join("primary"), base.join("shadow"));
+        let _ = std::fs::remove_dir_all(&base);
+        set_session_dir(&primary, Some(&shadow));
+        set_session(&sample()).expect("set_session");
+        let _ = std::fs::remove_file(primary.join(CAPSULE_FILE)); // lose the primary tier
+        assert_eq!(session().expect("shadow fallback"), sample());
+        *SESSION_DIRS.lock().unwrap() = None;
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
 
 fn derive_context(role: &str, app_id: &str) -> String {
