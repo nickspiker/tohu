@@ -277,6 +277,78 @@ fn session_path() -> Option<std::path::PathBuf> {
     Some(base.join("tohu").join("session"))
 }
 
+// ============================================================================ Reboot-surviving capsule (UNATTENDED MODE ONLY) ==========================
+//
+// DELIBERATELY DEFEATS the reboot-death property below. The boot-locked capsule dies on reboot BY DESIGN (fresh boot_id → undecryptable) so a stolen/seized powered-off device can't auto-attest. This capsule is the opposite: it seals the 96-byte roots under `device_secret()` (BLAKE3 of the stable hardware fingerprint — survives reboot, never on the wire), so a reboot on THIS hardware re-derives the session with no handle typed. That is a real security downgrade: a powered-off device that reboots comes back as YOU, unattended. It exists only for remote failsafe boxes the operator physically controls; photon gates it behind an off-by-default toggle + a big disclaimer, and this module refuses to make it the default (no auto-write; the caller opts in per store call).
+//
+// Bound to `device_secret` NOT the wairua, so copying the file to another machine is useless (wrong fingerprint → open fails), but on the SAME machine no user secret is required — that's the whole (dangerous) point.
+
+/// Seal the session roots for reboot survival and write to `path` (photon passes a durable config-dir path). Sealed under `device_secret()` — opens after a reboot on this hardware, useless if copied elsewhere. UNATTENDED MODE: the caller must gate this behind explicit opt-in.
+#[cfg(feature = "std")]
+pub fn store_reboot_capsule(s: &SessionIdentity, path: &std::path::Path) -> std::io::Result<()> {
+    use chacha20poly1305::{
+        ChaCha20Poly1305, Nonce,
+        aead::{Aead, KeyInit},
+    };
+    use rand::RngCore;
+    let key = crate::device::device_secret()?;
+    let mut roots = [0u8; 96];
+    roots[0..32].copy_from_slice(&s.identity_seed);
+    roots[32..64].copy_from_slice(&s.vault_seed);
+    roots[64..96].copy_from_slice(&s.handle_proof);
+    let cipher = ChaCha20Poly1305::new((&key).into());
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let ct = cipher.encrypt(&Nonce::from(nonce_bytes), roots.as_ref()).ok();
+    roots.iter_mut().for_each(|b| *b = 0);
+    let ct = ct.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "reboot-capsule seal failed"))?;
+    let mut out = Vec::with_capacity(8 + 12 + ct.len());
+    out.extend_from_slice(REBOOT_CAPSULE_MAGIC);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ct);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_private(path, &out)
+}
+
+/// Open a reboot capsule at `path`. `None` on absent file, wrong hardware (`device_secret` mismatch → AEAD fail), tamper, or corruption — so the caller's "None → typed attest" path fires untouched.
+#[cfg(feature = "std")]
+pub fn load_reboot_capsule(path: &std::path::Path) -> Option<SessionIdentity> {
+    use chacha20poly1305::{
+        ChaCha20Poly1305, Nonce,
+        aead::{Aead, KeyInit},
+    };
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() < 8 + 12 || &bytes[0..8] != REBOOT_CAPSULE_MAGIC {
+        return None;
+    }
+    let nonce = &bytes[8..20];
+    let ct = &bytes[20..];
+    let key = crate::device::device_secret().ok()?;
+    let cipher = ChaCha20Poly1305::new((&key).into());
+    let pt = cipher.decrypt(Nonce::from_slice(nonce), ct).ok()?;
+    if pt.len() != 96 {
+        return None;
+    }
+    let mut id = [0u8; 32];
+    let mut vs = [0u8; 32];
+    let mut hp = [0u8; 32];
+    id.copy_from_slice(&pt[0..32]);
+    vs.copy_from_slice(&pt[32..64]);
+    hp.copy_from_slice(&pt[64..96]);
+    Some(SessionIdentity { identity_seed: id, vault_seed: vs, handle_proof: hp })
+}
+
+/// Remove the reboot capsule (unattended mode turned off, or logout). Best-effort.
+#[cfg(feature = "std")]
+pub fn clear_reboot_capsule(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(feature = "std")]
+const REBOOT_CAPSULE_MAGIC: &[u8; 8] = b"TOHUREB1";
+
 // ============================================================================ Boot-locked session capsule ================================================
 //
 // The Android session that survives an app restart but dies on reboot, without a durable-disk secret or a (Samsung-flaky) sticky broadcast holding the raw roots.
@@ -797,6 +869,36 @@ mod tests {
         let precomposed = handle_seed("café");
         let decomposed = handle_seed("cafe\u{0301}");
         assert_eq!(precomposed, decomposed, "NFC must collapse to same seed");
+    }
+
+    #[test]
+    fn reboot_capsule_round_trips_and_rejects_tamper() {
+        // Needs a readable device fingerprint; skip where the oracle is absent (CI sandboxes).
+        if device::device_secret().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("tohu-rebtest-{}", std::process::id()));
+        let path = dir.join("reboot_capsule");
+        let s = SessionIdentity {
+            identity_seed: [7u8; 32],
+            vault_seed: [9u8; 32],
+            handle_proof: [11u8; 32],
+        };
+        store_reboot_capsule(&s, &path).unwrap();
+        let opened = load_reboot_capsule(&path).expect("same-device open");
+        assert_eq!(opened.identity_seed, s.identity_seed);
+        assert_eq!(opened.vault_seed, s.vault_seed);
+        assert_eq!(opened.handle_proof, s.handle_proof);
+        // Tamper a ciphertext byte → AEAD auth fails → None (caller falls through to typed attest).
+        let mut bytes = std::fs::read(&path).unwrap();
+        let n = bytes.len();
+        bytes[n - 1] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(load_reboot_capsule(&path).is_none(), "tamper must not open");
+        // Wrong magic → None.
+        std::fs::write(&path, b"XXXXXXXXnonsense").unwrap();
+        assert!(load_reboot_capsule(&path).is_none(), "bad magic must not open");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
