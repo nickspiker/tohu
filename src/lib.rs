@@ -186,7 +186,11 @@ pub fn session() -> Option<SessionIdentity> {
                 }
             }
         }
-        return None;
+        // Explicit session dirs (Android): a capsule miss is FINAL — falling to the tmp path would resurrect exactly the store the capsule design retired. Test-pinned.
+        if SESSION_DIRS.lock().unwrap().is_some() {
+            return None;
+        }
+        // Implicit capsule path (macOS): fall THROUGH to the legacy plain-file read — a Mac upgrading to the capsule store still holds its session in the old tmp path, and honouring it once means the upgrade costs no re-attest (the next set_session writes the capsule).
     }
     // Desktop: the raw 96 bytes in the XDG_RUNTIME_DIR tmpfs, which already dies at logout/reboot.
     let bytes = std::fs::read(session_path()?).ok()?;
@@ -325,12 +329,25 @@ pub fn set_session_dir(primary: &std::path::Path, shadow: Option<&std::path::Pat
 /// The capsule file path(s) — primary first, then shadow — or `None` on desktop (no dirs set → the tmpfs path is used instead).
 #[cfg(feature = "std")]
 fn session_capsule_paths() -> Option<Vec<std::path::PathBuf>> {
-    let (primary, shadow) = SESSION_DIRS.lock().unwrap().clone()?;
-    let mut v = vec![primary.join(CAPSULE_FILE)];
-    if let Some(sh) = shadow {
-        v.push(sh.join(CAPSULE_FILE));
+    if let Some((primary, shadow)) = SESSION_DIRS.lock().unwrap().clone() {
+        let mut v = vec![primary.join(CAPSULE_FILE)];
+        if let Some(sh) = shadow {
+            v.push(sh.join(CAPSULE_FILE));
+        }
+        return Some(v);
     }
-    Some(v)
+    // macOS: the tmp-dir fallback lived in DARWIN_USER_TEMP_DIR, which the OS's periodic maintenance PURGES (files untouched ~3 days, plus low-disk sweeps) — the session vanished with no reboot and the user was told to re-attest out of nowhere. Same cure as Android: a boot-locked capsule in DURABLE Application Support — the crypto enforces "dies on reboot" (kern.bootsessionuuid is fresh each boot), so the storage no longer has to be volatile, and nothing the cleaner does can log the user out.
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())?;
+        return Some(vec![home
+            .join("Library/Application Support/tohu")
+            .join(CAPSULE_FILE)]);
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
 }
 
 /// Write `bytes` to `path`, truncating, `0600` on unix.
@@ -354,12 +371,28 @@ fn boot_secret() -> Option<Vec<u8>> {
     if let Some(o) = BOOT_SECRET_OVERRIDE.lock().unwrap().clone() {
         return Some(o);
     }
-    let raw = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
+    // macOS has no /proc; kern.bootsessionuuid is the same fact by another name — fresh every boot, stable within one.
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "kern.bootsessionuuid"])
+            .output()
+            .ok()?;
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if s.is_empty() {
+            return None;
+        }
+        return Some(s.into_bytes());
     }
-    Some(trimmed.as_bytes().to_vec())
+    #[cfg(not(target_os = "macos"))]
+    {
+        let raw = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(trimmed.as_bytes().to_vec())
+    }
 }
 
 /// The *wairua* — the per-boot key the capsule is sealed under.
