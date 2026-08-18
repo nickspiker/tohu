@@ -287,7 +287,7 @@ fn session_path() -> Option<std::path::PathBuf> {
 #[cfg(feature = "std")]
 pub fn store_reboot_capsule(s: &SessionIdentity, path: &std::path::Path) -> std::io::Result<()> {
     use chacha20poly1305::{
-        ChaCha20Poly1305, Nonce,
+        XChaCha20Poly1305, XNonce,
         aead::{Aead, KeyInit},
     };
     use rand::RngCore;
@@ -296,13 +296,13 @@ pub fn store_reboot_capsule(s: &SessionIdentity, path: &std::path::Path) -> std:
     roots[0..32].copy_from_slice(&s.identity_seed);
     roots[32..64].copy_from_slice(&s.vault_seed);
     roots[64..96].copy_from_slice(&s.handle_proof);
-    let cipher = ChaCha20Poly1305::new((&key).into());
-    let mut nonce_bytes = [0u8; 12];
+    let cipher = XChaCha20Poly1305::new((&key).into());
+    let mut nonce_bytes = [0u8; 24];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let ct = cipher.encrypt(&Nonce::from(nonce_bytes), roots.as_ref()).ok();
+    let ct = cipher.encrypt(&XNonce::from(nonce_bytes), roots.as_ref()).ok();
     roots.iter_mut().for_each(|b| *b = 0);
     let ct = ct.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "reboot-capsule seal failed"))?;
-    let mut out = Vec::with_capacity(8 + 12 + ct.len());
+    let mut out = Vec::with_capacity(8 + 24 + ct.len());
     out.extend_from_slice(REBOOT_CAPSULE_MAGIC);
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ct);
@@ -316,18 +316,26 @@ pub fn store_reboot_capsule(s: &SessionIdentity, path: &std::path::Path) -> std:
 #[cfg(feature = "std")]
 pub fn load_reboot_capsule(path: &std::path::Path) -> Option<SessionIdentity> {
     use chacha20poly1305::{
-        ChaCha20Poly1305, Nonce,
+        ChaCha20Poly1305, Nonce, XChaCha20Poly1305, XNonce,
         aead::{Aead, KeyInit},
     };
     let bytes = std::fs::read(path).ok()?;
-    if bytes.len() < 8 + 12 || &bytes[0..8] != REBOOT_CAPSULE_MAGIC {
+    if bytes.len() < 8 + 12 {
         return None;
     }
-    let nonce = &bytes[8..20];
-    let ct = &bytes[20..];
     let key = crate::device::device_secret().ok()?;
-    let cipher = ChaCha20Poly1305::new((&key).into());
-    let pt = cipher.decrypt(Nonce::from_slice(nonce), ct).ok()?;
+    // Read-both by magic (2026-08-18 XChaCha migration): TOHUREB2 = 24-byte XChaCha nonce; the legacy
+    // TOHUREB1 = 12-byte ChaCha nonce. A capsule is a re-derivable per-hardware cache, so a magic miss
+    // just falls through to None → re-attest; read-both makes the one post-update reboot seamless too.
+    let pt = if &bytes[0..8] == REBOOT_CAPSULE_MAGIC && bytes.len() >= 8 + 24 {
+        let nonce = XNonce::try_from(&bytes[8..32]).ok()?;
+        XChaCha20Poly1305::new((&key).into()).decrypt(&nonce, &bytes[32..]).ok()?
+    } else if &bytes[0..8] == REBOOT_CAPSULE_MAGIC_V1 {
+        let nonce = Nonce::try_from(&bytes[8..20]).ok()?;
+        ChaCha20Poly1305::new((&key).into()).decrypt(&nonce, &bytes[20..]).ok()?
+    } else {
+        return None;
+    };
     if pt.len() != 96 {
         return None;
     }
@@ -347,7 +355,10 @@ pub fn clear_reboot_capsule(path: &std::path::Path) {
 }
 
 #[cfg(feature = "std")]
-const REBOOT_CAPSULE_MAGIC: &[u8; 8] = b"TOHUREB1";
+const REBOOT_CAPSULE_MAGIC: &[u8; 8] = b"TOHUREB2";
+/// Legacy 12-byte-nonce ChaCha20-Poly1305 reboot capsule (pre-2026-08-18). Read-both only; never minted. MIGRATION: drop with the legacy branch in `load_reboot_capsule` a few versions out.
+#[cfg(feature = "std")]
+const REBOOT_CAPSULE_MAGIC_V1: &[u8; 8] = b"TOHUREB1";
 
 // ============================================================================ Boot-locked session capsule ================================================
 //
@@ -365,11 +376,13 @@ pub enum SealMode {
     Shared,
 }
 
-/// 8-byte capsule magic; the trailing digit is the format version, so a future format bump (`TOHUSES2`) makes old capsules fall through to `None` → attest, with no backward-compat path (pre-public; nuke-and-restart).
+/// 8-byte capsule magic; the trailing digit is the format version. Bumped to `TOHUSES2` in the 2026-08-18 XChaCha migration (24-byte nonce); `open_session` read-boths the legacy `TOHUSES1` (12-byte ChaCha nonce) by magic.
 ///
 /// INTERIM FORMAT — the envelope (`MAGIC ‖ mode ‖ [MAC] ‖ nonce ‖ ct+tag`) is a plain versioned binary, fine for testing but NOT final: before finalization the capsule MUST become a full spec-compliant VSF document (for tooling/self-description/forward-compat reasons).
 /// The whole format is contained in `seal_session`/`open_session` and callers only pass opaque bytes, so that swap is localized here and touches nothing built on top.
-const CAPSULE_MAGIC: &[u8; 8] = b"TOHUSES1";
+const CAPSULE_MAGIC: &[u8; 8] = b"TOHUSES2";
+/// Legacy 12-byte-nonce ChaCha20-Poly1305 session capsule (pre-2026-08-18). Read-both only; never minted. MIGRATION: drop with the legacy branch in `open_session` a few versions out.
+const CAPSULE_MAGIC_V1: &[u8; 8] = b"TOHUSES1";
 
 #[cfg(feature = "std")]
 static BOOT_SECRET_OVERRIDE: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
@@ -488,7 +501,7 @@ fn wairua(mode: SealMode) -> Option<[u8; 32]> {
 #[cfg(feature = "std")]
 pub fn seal_session(s: &SessionIdentity, mode: SealMode) -> Option<Vec<u8>> {
     use chacha20poly1305::{
-        ChaCha20Poly1305, Nonce,
+        XChaCha20Poly1305, XNonce,
         aead::{Aead, KeyInit},
     };
     use rand::RngCore;
@@ -499,14 +512,14 @@ pub fn seal_session(s: &SessionIdentity, mode: SealMode) -> Option<Vec<u8>> {
     roots[32..64].copy_from_slice(&s.vault_seed);
     roots[64..96].copy_from_slice(&s.handle_proof);
 
-    let cipher = ChaCha20Poly1305::new((&key).into());
-    let mut nonce_bytes = [0u8; 12];
+    let cipher = XChaCha20Poly1305::new((&key).into());
+    let mut nonce_bytes = [0u8; 24];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let ct = cipher.encrypt(&Nonce::from(nonce_bytes), roots.as_ref()).ok();
+    let ct = cipher.encrypt(&XNonce::from(nonce_bytes), roots.as_ref()).ok();
     roots.iter_mut().for_each(|b| *b = 0); // don't leave plaintext roots in the stack buffer
     let ct = ct?;
 
-    let mut blob = Vec::with_capacity(12 + ct.len());
+    let mut blob = Vec::with_capacity(24 + ct.len());
     blob.extend_from_slice(&nonce_bytes);
     blob.extend_from_slice(&ct);
 
@@ -523,14 +536,19 @@ pub fn seal_session(s: &SessionIdentity, mode: SealMode) -> Option<Vec<u8>> {
 
 /// Open a capsule sealed by [`seal_session`] under the current *wairua*.
 /// `None` on any failure — bad magic/version, mode mismatch, `device_secret` MAC mismatch (`Shared`), or AEAD auth failure (a wrong *wairua* = reboot, or tamper, or corruption) — so the caller's existing "`None` → attest" path fires untouched.
+/// Read-both by magic (2026-08-18 XChaCha migration): TOHUSES2 = 24-byte XChaCha nonce; legacy TOHUSES1 = 12-byte ChaCha nonce. The MAC (Shared mode) covers the nonce‖ct blob regardless of nonce width.
 #[cfg(feature = "std")]
 pub fn open_session(bytes: &[u8], mode: SealMode) -> Option<SessionIdentity> {
     use chacha20poly1305::{
-        ChaCha20Poly1305, Nonce,
+        ChaCha20Poly1305, Nonce, XChaCha20Poly1305, XNonce,
         aead::{Aead, KeyInit},
     };
 
-    if bytes.len() < 9 || &bytes[0..8] != CAPSULE_MAGIC || bytes[8] != mode as u8 {
+    if bytes.len() < 9 || bytes[8] != mode as u8 {
+        return None;
+    }
+    let legacy = &bytes[0..8] == CAPSULE_MAGIC_V1;
+    if &bytes[0..8] != CAPSULE_MAGIC && !legacy {
         return None;
     }
     let body = &bytes[9..];
@@ -551,14 +569,19 @@ pub fn open_session(bytes: &[u8], mode: SealMode) -> Option<SessionIdentity> {
         body
     };
 
-    if blob.len() < 12 + 16 {
+    let nonce_len = if legacy { 12 } else { 24 };
+    if blob.len() < nonce_len + 16 {
         return None;
     }
-    let (nonce_bytes, ct) = blob.split_at(12);
+    let (nonce_bytes, ct) = blob.split_at(nonce_len);
     let key = wairua(mode)?;
-    let cipher = ChaCha20Poly1305::new((&key).into());
-    let nonce = Nonce::try_from(nonce_bytes).ok()?;
-    let pt = cipher.decrypt(&nonce, ct).ok()?;
+    let pt = if legacy {
+        let nonce = Nonce::try_from(nonce_bytes).ok()?;
+        ChaCha20Poly1305::new((&key).into()).decrypt(&nonce, ct).ok()?
+    } else {
+        let nonce = XNonce::try_from(nonce_bytes).ok()?;
+        XChaCha20Poly1305::new((&key).into()).decrypt(&nonce, ct).ok()?
+    };
     if pt.len() != 96 {
         return None;
     }
@@ -608,6 +631,31 @@ mod capsule_tests {
         let cap = seal_session(&sample(), SealMode::Local).expect("seal");
         set_boot_secret_override(b"boot-B");
         assert!(open_session(&cap, SealMode::Local).is_none());
+    }
+
+    /// A legacy TOHUSES1 (12-byte ChaCha nonce) capsule must still open — the read-both migration path.
+    /// Synthesized directly under the same wairua the new sealer would use.
+    #[test]
+    fn opens_legacy_tohuses1_capsule() {
+        use chacha20poly1305::{ChaCha20Poly1305, Nonce, aead::{Aead, KeyInit}};
+        let _g = TEST_LOCK.lock().unwrap();
+        set_boot_secret_override(b"boot-legacy");
+        let key = wairua(SealMode::Local).expect("wairua");
+        let s = sample();
+        let mut roots = [0u8; 96];
+        roots[0..32].copy_from_slice(&s.identity_seed);
+        roots[32..64].copy_from_slice(&s.vault_seed);
+        roots[64..96].copy_from_slice(&s.handle_proof);
+        let nonce = [0x55u8; 12];
+        let ct = ChaCha20Poly1305::new((&key).into())
+            .encrypt(&Nonce::from(nonce), roots.as_ref())
+            .unwrap();
+        let mut cap = Vec::new();
+        cap.extend_from_slice(CAPSULE_MAGIC_V1); // TOHUSES1
+        cap.push(SealMode::Local as u8);
+        cap.extend_from_slice(&nonce);
+        cap.extend_from_slice(&ct);
+        assert_eq!(open_session(&cap, SealMode::Local).expect("open legacy"), s);
     }
 
     #[test]
