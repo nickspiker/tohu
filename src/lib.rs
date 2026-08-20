@@ -290,9 +290,9 @@ fn session_path() -> Option<std::path::PathBuf> {
 //
 // Bound to `device_secret` NOT the wairua, so copying the file to another machine is useless (wrong fingerprint → open fails), but on the SAME machine no user secret is required — that's the whole (dangerous) point.
 
-/// Seal the session roots for reboot survival and write to `path` (photon passes a durable config-dir path). Sealed under `device_secret()` — opens after a reboot on this hardware, useless if copied elsewhere. UNATTENDED MODE: the caller must gate this behind explicit opt-in.
+/// Seal the session roots for reboot survival, returned as opaque capsule BYTES — the caller owns placement (photon stores them as a device-scope vault entry). Sealed under `device_secret()` — opens after a reboot on this hardware, useless if copied elsewhere. UNATTENDED MODE: the caller must gate this behind explicit opt-in.
 #[cfg(feature = "std")]
-pub fn store_reboot_capsule(s: &SessionIdentity, path: &std::path::Path) -> std::io::Result<()> {
+pub fn seal_reboot_capsule(s: &SessionIdentity) -> std::io::Result<Vec<u8>> {
     use chacha20poly1305::{
         XChaCha20Poly1305, XNonce,
         aead::{Aead, KeyInit},
@@ -313,20 +313,26 @@ pub fn store_reboot_capsule(s: &SessionIdentity, path: &std::path::Path) -> std:
     out.extend_from_slice(REBOOT_CAPSULE_MAGIC);
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// File-placement wrapper over [`seal_reboot_capsule`] — kept for callers that still park the capsule as a loose file.
+#[cfg(feature = "std")]
+pub fn store_reboot_capsule(s: &SessionIdentity, path: &std::path::Path) -> std::io::Result<()> {
+    let out = seal_reboot_capsule(s)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     write_private(path, &out)
 }
 
-/// Open a reboot capsule at `path`. `None` on absent file, wrong hardware (`device_secret` mismatch → AEAD fail), tamper, or corruption — so the caller's "None → typed attest" path fires untouched.
+/// Open reboot-capsule BYTES (the counterpart of [`seal_reboot_capsule`]). `None` on wrong hardware (`device_secret` mismatch → AEAD fail), tamper, or corruption — so the caller's "None → typed attest" path fires untouched.
 #[cfg(feature = "std")]
-pub fn load_reboot_capsule(path: &std::path::Path) -> Option<SessionIdentity> {
+pub fn open_reboot_capsule(bytes: &[u8]) -> Option<SessionIdentity> {
     use chacha20poly1305::{
         ChaCha20Poly1305, Nonce, XChaCha20Poly1305, XNonce,
         aead::{Aead, KeyInit},
     };
-    let bytes = std::fs::read(path).ok()?;
     if bytes.len() < 8 + 12 {
         return None;
     }
@@ -353,6 +359,12 @@ pub fn load_reboot_capsule(path: &std::path::Path) -> Option<SessionIdentity> {
     vs.copy_from_slice(&pt[32..64]);
     hp.copy_from_slice(&pt[64..96]);
     Some(SessionIdentity { identity_seed: id, vault_seed: vs, handle_proof: hp })
+}
+
+/// File-reading wrapper over [`open_reboot_capsule`] — kept for callers that still park the capsule as a loose file.
+#[cfg(feature = "std")]
+pub fn load_reboot_capsule(path: &std::path::Path) -> Option<SessionIdentity> {
+    open_reboot_capsule(&std::fs::read(path).ok()?)
 }
 
 /// Remove the reboot capsule (unattended mode turned off, or logout). Best-effort.
