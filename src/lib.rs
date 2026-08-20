@@ -51,6 +51,13 @@ pub fn vault_path_name(
     base64url_encode(&addr)
 }
 
+/// Per-app per-DEVICE opaque vault filename — the identity-free variant (2026-08-20, the one-device-vault consolidation): the vault exists from FIRST LAUNCH, before any handle is typed, so its name can only derive from what the device already holds. Same output shape as [`vault_path_name`]; a distinct context string keeps the two namespaces disjoint forever.
+pub fn device_vault_path_name(app_id: &str, device_secret: &[u8; 32]) -> String {
+    let context = derive_context("vault-path-device", app_id);
+    let addr: [u8; 32] = blake3::derive_key(&context, device_secret);
+    base64url_encode(&addr)
+}
+
 /// Per-app per-handle per-device anchor key. Used as the root for vault encryption keys / record-level AEAD keys.
 pub fn vault_anchor_key(
     app_id: &str,
