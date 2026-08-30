@@ -1,6 +1,6 @@
 [package]
 name = "tohu"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 description = "Device identity for the TOKEN/FGTW app stack: per-platform device oracle + frozen v0 key derivation (handle → seed → vault path/key). The sign drawn from the formless."
 license = "MIT OR Apache-2.0"
@@ -13,7 +13,7 @@ categories = ["cryptography", "no-std"]
 blake3 = { version = "1", default-features = false }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 # vsf "0.6" is the FROZEN ENCODER LANE. The x encoder (NFC + full-codespace Huffman) behind handle_seed must never move; pinning the frozen lane keeps handle_seed byte-identical to ihi::handle_to_hash so vault_seed and identity_seed share the same canonicalization contract. ihi pins the same lane independently — two parallel pins by design, not an accident. Do not bump either without a coordinated stack migration.
-vsf = { version = "0.6", default-features = false, features = ["text-encode"] }
+vsf = { version = "0.9.3", path = "../vsf", default-features = false, features = ["text-encode"] }
 
 # ihi::spaghettify (fast, ms) is the wairua derivation for the boot-locked session capsule. Crypto-only deps (blake3/sha2/sha3), no network — keeps tohu's audit claim. ihi does not depend on tohu, so this is acyclic (kete → tohu, so tohu must never depend on kete; the capsule's AEAD is chacha20poly1305 direct, not kete).
 ihi = { version = "0.0.48", path = "../ihi", default-features = false }
