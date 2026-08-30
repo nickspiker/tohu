@@ -338,8 +338,7 @@ pub fn open_reboot_capsule(bytes: &[u8]) -> Option<SessionIdentity> {
     }
     let key = crate::device::device_secret().ok()?;
     // Read-both by magic (2026-08-18 XChaCha migration): TOHUREB2 = 24-byte XChaCha nonce; the legacy
-    // TOHUREB1 = 12-byte ChaCha nonce. A capsule is a re-derivable per-hardware cache, so a magic miss
-    // just falls through to None → re-attest; read-both makes the one post-update reboot seamless too.
+    // TOHUREB1 = 12-byte ChaCha nonce. A capsule is a re-derivable per-hardware cache, so a magic miss just falls through to None → re-attest; read-both makes the one post-update reboot seamless too.
     let pt = if &bytes[0..8] == REBOOT_CAPSULE_MAGIC && bytes.len() >= 8 + 24 {
         let nonce = XNonce::try_from(&bytes[8..32]).ok()?;
         XChaCha20Poly1305::new((&key).into()).decrypt(&nonce, &bytes[32..]).ok()?
