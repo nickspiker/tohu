@@ -24,6 +24,10 @@ extern crate alloc;
 
 use alloc::string::String;
 
+/// The handle-slot wire: `Get`/`Set`/`Clear`/`Health` as framed VSF, shared verbatim by the desktop socket agent and the Android broker service (`docs/handle.md`). Moves an already-derived seed between processes; touches no derivation.
+#[cfg(feature = "std")]
+pub mod agent;
+
 /// Frozen version suffix. Every context string in this crate ends with this. Bumping to `v1` means a coordinated migration across all stack apps.
 pub const VERSION: &str = "v0";
 
@@ -267,6 +271,22 @@ pub fn clear_session() {
     if let Some(p) = session_path() {
         let _ = std::fs::remove_file(p);
     }
+}
+
+/// The device-rooted address of the one handle slot (`docs/handle.md`).
+///
+/// `vault_path_name("tohu", handle_seed("handle"), device_secret)` — every app computes the same
+/// 43-char base64url string with no negotiation, which is the point: the slot needs no registry
+/// and no agreed constant beyond this one line. `"tohu"` as the app_id keeps it in tohu's own
+/// namespace, disjoint from every app's vault by the same `app_id` domain separation that keeps
+/// apps disjoint from each other.
+///
+/// Device-rooted, so the address differs per machine even for the same user — a slot id observed
+/// on one device says nothing about where the slot lives on another.
+#[cfg(feature = "std")]
+pub fn handle_slot_id() -> std::io::Result<String> {
+    let device = device::device_secret()?;
+    Ok(vault_path_name("tohu", &handle_seed("handle"), &device))
 }
 
 #[cfg(feature = "std")]
