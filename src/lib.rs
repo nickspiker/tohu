@@ -190,13 +190,17 @@ pub struct SessionIdentity {
 pub fn session() -> Option<SessionIdentity> {
     // Android (session dirs set): the boot-locked capsule in the local file tiers — survives an app restart on every device (the tmpfs path below is wiped on Android), dies on reboot via the wairua. Try each tier; first that opens under the current wairua wins.
     if let Some(paths) = session_capsule_paths() {
-        for p in paths {
-            if let Ok(bytes) = std::fs::read(&p) {
+        let mut present: Option<std::path::PathBuf> = None;
+        for p in &paths {
+            if let Ok(bytes) = std::fs::read(p) {
                 if let Some(s) = open_session(&bytes, SealMode::Local) {
+                    *LAST_MISS.lock().unwrap() = None;
                     return Some(s);
                 }
+                present.get_or_insert_with(|| p.clone());
             }
         }
+        *LAST_MISS.lock().unwrap() = Some(diagnose_miss(present.as_deref()));
         // Explicit session dirs (Android): a capsule miss is FINAL — falling to the tmp path would resurrect exactly the store the capsule design retired. Test-pinned.
         if SESSION_DIRS.lock().unwrap().is_some() {
             return None;
@@ -232,11 +236,18 @@ pub fn set_session(s: &SessionIdentity) -> std::io::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         write_private(primary, &cap)?;
+        let tag = boot_tag();
+        if let Some(t) = tag {
+            let _ = write_private(&primary.with_file_name(BOOT_TAG_FILE), &t);
+        }
         for shadow in iter {
             if let Some(parent) = shadow.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
             let _ = write_private(shadow, &cap);
+            if let Some(t) = tag {
+                let _ = write_private(&shadow.with_file_name(BOOT_TAG_FILE), &t);
+            }
         }
         return Ok(());
     }
@@ -264,6 +275,7 @@ pub fn set_session(s: &SessionIdentity) -> std::io::Result<()> {
 pub fn clear_session() {
     if let Some(paths) = session_capsule_paths() {
         for p in paths {
+            let _ = std::fs::remove_file(p.with_file_name(BOOT_TAG_FILE));
             let _ = std::fs::remove_file(p);
         }
         return;
@@ -435,6 +447,51 @@ pub fn set_boot_secret_override(secret: &[u8]) {
 
 /// Local-tier capsule filename, placed under each session dir.
 const CAPSULE_FILE: &str = "tohu.session.cap";
+
+/// Beside each local capsule: a ONE-WAY tag of the boot secret it was sealed under — never the secret itself, which would let a stale capsule open after a reboot. Read only to say WHY a launch's capsule did not open (field 2026-10-14, Jeff: "got kicked off again and did not reboot" — the log could not tell a restart the phone made on its own from a session that broke).
+const BOOT_TAG_FILE: &str = "tohu.session.boot";
+
+#[cfg(feature = "std")]
+static LAST_MISS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Why the last [`session`] call found no session in the capsule tiers, in words for a log — `None` when it found one, or has not looked. Never contains a secret.
+#[cfg(feature = "std")]
+pub fn session_miss() -> Option<String> {
+    LAST_MISS.lock().unwrap().clone()
+}
+
+#[cfg(feature = "std")]
+fn boot_tag() -> Option<[u8; 16]> {
+    let b = boot_secret()?;
+    let h = blake3::derive_key("tohu session boot tag v0", &b);
+    let mut t = [0u8; 16];
+    t.copy_from_slice(&h[..16]);
+    Some(t)
+}
+
+/// The miss, explained: no capsule at all, or one sealed under another boot (the device restarted since — the boot-lock working as designed), or one sealed under THIS boot that still would not open (damage), with the capsule's age.
+#[cfg(feature = "std")]
+fn diagnose_miss(present: Option<&std::path::Path>) -> String {
+    let Some(p) = present else {
+        return "no saved session in any tier (never saved on this install, or cleared by a logout / lockout)".into();
+    };
+    let age = std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|d| {
+            let s = d.as_secs();
+            if s >= 86_400 { format!("{}d {}h", s / 86_400, s % 86_400 / 3600) } else { format!("{}h {}m", s / 3600, s % 3600 / 60) }
+        })
+        .unwrap_or_else(|| "unknown".into());
+    let saved = std::fs::read(p.with_file_name(BOOT_TAG_FILE)).ok();
+    match (saved, boot_tag()) {
+        (_, None) => format!("a saved session (written {age} ago) but no boot secret this launch — cannot derive its key"),
+        (None, Some(_)) => format!("a saved session (written {age} ago) that will not open; it predates the boot tag, so a restart cannot be told from damage"),
+        (Some(t), Some(now)) if t.as_slice() == now.as_slice() => format!("a saved session (written {age} ago) under THIS boot that will not open — damaged or tampered"),
+        (Some(_), Some(_)) => format!("a saved session (written {age} ago) under a DIFFERENT boot — the device restarted since it was saved"),
+    }
+}
 
 #[cfg(feature = "std")]
 static SESSION_DIRS: std::sync::Mutex<Option<(std::path::PathBuf, Option<std::path::PathBuf>)>> =
@@ -633,6 +690,31 @@ pub fn open_session(bytes: &[u8], mode: SealMode) -> Option<SessionIdentity> {
 #[cfg(all(test, feature = "std"))]
 mod capsule_tests {
     use super::*;
+
+    #[test]
+    fn a_miss_says_whether_the_device_restarted() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("tohu-miss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        set_session_dir(&dir, None);
+        set_boot_secret_override(b"bootcount:41");
+        clear_session();
+        assert!(session().is_none());
+        assert!(session_miss().unwrap().starts_with("no saved session"));
+        set_session(&sample()).unwrap();
+        assert!(session().is_some());
+        assert!(session_miss().is_none());
+        set_boot_secret_override(b"bootcount:42");
+        assert!(session().is_none());
+        assert!(session_miss().unwrap().contains("DIFFERENT boot"), "{:?}", session_miss());
+        set_boot_secret_override(b"bootcount:41");
+        std::fs::write(dir.join(CAPSULE_FILE), b"TOHUSES2 garbage").unwrap();
+        assert!(session().is_none());
+        assert!(session_miss().unwrap().contains("THIS boot"), "{:?}", session_miss());
+        *SESSION_DIRS.lock().unwrap() = None;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // The wairua override is process-global, so serialize the tests that set it.
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
