@@ -200,6 +200,18 @@ pub fn session() -> Option<SessionIdentity> {
                 present.get_or_insert_with(|| p.clone());
             }
         }
+        // A capsule an earlier build sealed under the LEGACY boot secret (set_boot_secret_legacy) opens once and is re-sealed under the current secret on the spot, so moving the boot-secret source costs nobody a re-attest. A real reboot changes the legacy value too, so this never reopens a capsule across a power cycle.
+        if let Some(legacy) = BOOT_SECRET_LEGACY.lock().unwrap().clone() {
+            for p in &paths {
+                if let Ok(bytes) = std::fs::read(p) {
+                    if let Some(s) = open_session_under(&bytes, SealMode::Local, &legacy) {
+                        let _ = set_session(&s);
+                        *LAST_MISS.lock().unwrap() = None;
+                        return Some(s);
+                    }
+                }
+            }
+        }
         *LAST_MISS.lock().unwrap() = Some(diagnose_miss(present.as_deref()));
         // A capsule miss is FINAL on every capsule platform (Android's session dirs, macOS's Application Support): falling to the tmp path would resurrect exactly the store the capsule design retired. The macOS one-time upgrade read of the old tmp file is gone (Nick 2026-10-17, "Ditch the old!") — a Mac still on it re-attests once. Test-pinned.
         return None;
@@ -429,6 +441,16 @@ pub fn set_boot_secret_override(secret: &[u8]) {
     *BOOT_SECRET_OVERRIDE.lock().unwrap() = Some(secret.to_vec());
 }
 
+#[cfg(feature = "std")]
+static BOOT_SECRET_LEGACY: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+
+/// A boot secret an EARLIER build sealed capsules under, tried only when the current one opens nothing — the capsule that opens is re-sealed under the current secret at once.
+/// Android 2026-10-21: the platform moved from `Settings.Global.BOOT_COUNT` (which a userspace restart bumps without a power cycle — Jeff re-attested on a phone 14 days up) to the kernel `boot_id`; the count, still per-boot, is the legacy secret for one hop.
+#[cfg(feature = "std")]
+pub fn set_boot_secret_legacy(secret: &[u8]) {
+    *BOOT_SECRET_LEGACY.lock().unwrap() = Some(secret.to_vec());
+}
+
 /// Local-tier capsule filename, placed under each session dir.
 const CAPSULE_FILE: &str = "tohu.session.cap";
 
@@ -564,10 +586,15 @@ fn boot_secret() -> Option<Vec<u8>> {
 /// Dies on reboot because the boot secret does; `None` if there is no boot-secret source (or, for `Shared`, no `device_secret`).
 #[cfg(feature = "std")]
 fn wairua(mode: SealMode) -> Option<[u8; 32]> {
-    let boot = boot_secret()?;
+    wairua_for(&boot_secret()?, mode)
+}
+
+/// The *wairua* under an explicit boot secret — the current one, or the legacy one a capsule from an earlier build may still be sealed under ([`set_boot_secret_legacy`]).
+#[cfg(feature = "std")]
+fn wairua_for(boot: &[u8], mode: SealMode) -> Option<[u8; 32]> {
     let mut input = Vec::with_capacity(16 + boot.len() + 32);
     input.extend_from_slice(b"tohu-wairua-v0:");
-    input.extend_from_slice(&boot);
+    input.extend_from_slice(boot);
     if mode == SealMode::Shared {
         input.extend_from_slice(&crate::device::device_secret().ok()?);
     }
@@ -618,6 +645,12 @@ pub fn seal_session(s: &SessionIdentity, mode: SealMode) -> Option<Vec<u8>> {
 /// TOHUSES2 only: 24-byte XChaCha nonce; the MAC (Shared mode) covers the nonce‖ct blob.
 #[cfg(feature = "std")]
 pub fn open_session(bytes: &[u8], mode: SealMode) -> Option<SessionIdentity> {
+    open_session_under(bytes, mode, &boot_secret()?)
+}
+
+/// [`open_session`] under an explicit boot secret.
+#[cfg(feature = "std")]
+fn open_session_under(bytes: &[u8], mode: SealMode, boot: &[u8]) -> Option<SessionIdentity> {
     use chacha20poly1305::{
         XChaCha20Poly1305, XNonce,
         aead::{Aead, KeyInit},
@@ -651,7 +684,7 @@ pub fn open_session(bytes: &[u8], mode: SealMode) -> Option<SessionIdentity> {
         return None;
     }
     let (nonce_bytes, ct) = blob.split_at(24);
-    let key = wairua(mode)?;
+    let key = wairua_for(boot, mode)?;
     let nonce = XNonce::try_from(nonce_bytes).ok()?;
     let pt = XChaCha20Poly1305::new((&key).into()).decrypt(&nonce, ct).ok()?;
     if pt.len() != 96 {
@@ -689,6 +722,30 @@ mod capsule_tests {
         std::fs::write(dir.join(CAPSULE_FILE), b"TOHUSES2 garbage").unwrap();
         assert!(session().is_none());
         assert!(session_miss().unwrap().contains("THIS boot"), "{:?}", session_miss());
+        *SESSION_DIRS.lock().unwrap() = None;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Moving the boot-secret source costs no re-attest: a capsule sealed under the old secret opens through the legacy secret and is re-sealed under the new one, after which it opens without it; a legacy value from another boot opens nothing.
+    #[test]
+    fn a_legacy_boot_secret_opens_once_and_reseals() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("tohu-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        set_session_dir(&dir, None);
+        set_boot_secret_override(b"bootcount:7");
+        set_session(&sample()).unwrap();
+        // The new source: the kernel boot_id.
+        set_boot_secret_override(b"0b9cfa1e-5d3a-4c2e-9f0a-2b7e6c1d8a44");
+        *BOOT_SECRET_LEGACY.lock().unwrap() = None;
+        assert!(session().is_none(), "without the legacy secret the old capsule stays shut");
+        set_boot_secret_legacy(b"bootcount:8");
+        assert!(session().is_none(), "a count from another boot (a real reboot) opens nothing");
+        set_boot_secret_legacy(b"bootcount:7");
+        assert_eq!(session(), Some(sample()), "the old capsule opens through the legacy secret");
+        *BOOT_SECRET_LEGACY.lock().unwrap() = None;
+        assert_eq!(session(), Some(sample()), "and was re-sealed under the current secret");
         *SESSION_DIRS.lock().unwrap() = None;
         let _ = std::fs::remove_dir_all(&dir);
     }
