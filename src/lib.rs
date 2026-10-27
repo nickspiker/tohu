@@ -313,6 +313,10 @@ pub fn handle_slot_id() -> std::io::Result<String> {
 #[cfg(feature = "std")]
 fn session_path() -> Option<std::path::PathBuf> {
     use std::path::PathBuf;
+    // ferros keeps no session file: there is no filesystem, and the session will live in the vault (STD-TARGET.md in the ferros repo).
+    if cfg!(target_os = "ferros") {
+        return None;
+    }
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())

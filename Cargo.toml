@@ -31,3 +31,7 @@ std = ["blake3/std", "dep:chacha20poly1305", "dep:rand"]
 
 [dev-dependencies]
 hex = "0.4"
+
+# target_os = "ferros" is the phone as a ferros process (a JSON target): rustc does not know the name, so the cfg is declared here.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"))'] }
