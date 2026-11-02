@@ -1010,7 +1010,7 @@ pub mod device {
     }
 
     #[cfg(target_os = "android")]
-    pub use android::{android_id, android_init, android_root, android_select_root, signing_cert, widevine_id, widevine_root, Widevine};
+    pub use android::{android_id, android_init, android_root, android_select_root, signing_cert, widevine_id, widevine_root, widevine_root_parts, Widevine};
 
     // NEEDS ON-DEVICE TEST: this path only compiles under an android target and only runs on a device — it has NOT been executed. JNI calls target jni 0.21. The app `Context` is fetched via `ActivityThread.currentApplication()` so no Java-side change is needed; the only thing the app must do is hand tohu the JavaVM once via [`android_init`] (from its `JNI_OnLoad`). Build the APK to compile-verify before relying on it.
     #[cfg(target_os = "android")]
@@ -1053,9 +1053,14 @@ pub mod device {
         /// The Widevine root: `deviceUniqueId` ‖ the APK signing certificate's DER, so the plate is one value across the app family and another for anyone else's build.
         /// The error is an error: a transient CDM failure must never flip a device onto a different root, so nothing here falls back.
         pub fn widevine_root() -> io::Result<Vec<u8>> {
-            let mut root = widevine_id()?.device_unique_id;
-            root.extend_from_slice(&signing_cert()?);
+            let (mut root, cert) = widevine_root_parts()?;
+            root.extend_from_slice(&cert);
             Ok(root)
+        }
+
+        /// The two parts of [`widevine_root`], the device ID and the certificate, apart: for an app that logs or compares the hardware part on its own.
+        pub fn widevine_root_parts() -> io::Result<(Vec<u8>, Vec<u8>)> {
+            Ok((widevine_id()?.device_unique_id, signing_cert()?))
         }
 
         /// `Settings.Secure.getString(ActivityThread.currentApplication().getContentResolver(), "android_id")`.
