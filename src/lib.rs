@@ -935,6 +935,178 @@ pub mod device {
         std::fs::read("/etc/machine-id")
     }
 
+    #[cfg(target_os = "linux")]
+    pub use tpm::tpm_plate;
+
+    /// The TPM 2.0 plate on Linux (docs/oracle-hardening.md): the endorsement key's public half, derived by the chip from its endorsement seed every time it is asked, so nothing is stored anywhere; hashed into 32 bytes.
+    /// It survives an OS reinstall and a TPM clear, and only a firmware TPM reset or a logic board swap changes it. It is reported, not answered: a plate, not a proof.
+    /// Raw TPM 2.0 commands over `/dev/tpmrm0`, the kernel's resource manager, with no C library, so the crate's "nothing here can reach the network" claim stays checkable from its dependency list.
+    /// The device is `root:tss` mode 0660 on every major distribution, so the plate is absent until the user is in `tss`; absent means the machine keeps its `machine-id` posture exactly as before.
+    #[cfg(target_os = "linux")]
+    mod tpm {
+        use std::io::{self, Read, Write};
+
+        const DEVICE: &str = "/dev/tpmrm0";
+        const ST_SESSIONS: u16 = 0x8002;
+        const ST_NO_SESSIONS: u16 = 0x8001;
+        const CC_CREATE_PRIMARY: u32 = 0x0000_0131;
+        const CC_FLUSH_CONTEXT: u32 = 0x0000_0165;
+        const RH_ENDORSEMENT: u32 = 0x4000_000B;
+        const RS_PW: u32 = 0x4000_0009;
+        const ALG_RSA: u16 = 0x0001;
+        const ALG_SHA256: u16 = 0x000B;
+        const ALG_AES: u16 = 0x0006;
+        const ALG_CFB: u16 = 0x0043;
+        const ALG_NULL: u16 = 0x0010;
+        /// fixedTPM | fixedParent | sensitiveDataOrigin | adminWithPolicy | restricted | decrypt: the TCG EK Credential Profile's RSA-2048 template, the same one `tpm2_createek -G rsa` sends, so its `-u` output hashes to this plate.
+        const EK_ATTRIBUTES: u32 = 0x0003_00B2;
+        /// The profile's fixed authorization policy for the EK (PolicySecret under the endorsement authorization).
+        const EK_POLICY: [u8; 32] = [
+            0x83, 0x71, 0x97, 0x67, 0x44, 0x84, 0xb3, 0xf8, 0x1a, 0x90, 0xcc, 0x8d, 0x46, 0xa5, 0xd7, 0x24,
+            0xfd, 0x52, 0xd7, 0x6e, 0x06, 0x52, 0x0b, 0x64, 0xf2, 0xa1, 0xda, 0x1b, 0x33, 0x14, 0x69, 0xaa,
+        ];
+        /// A response is read whole in one call; the EK response is under a kilobyte, this leaves room for any creation data a chip adds.
+        const RESPONSE_CAPACITY: usize = 1 << 12;
+
+        /// `TPM2_CreatePrimary` under the endorsement hierarchy with the EK template, marshalled by hand (TPM 2.0 Library Part 3 §24.1), password session with an empty password.
+        pub(super) fn create_primary_ek_command() -> Vec<u8> {
+            let mut public = Vec::new();
+            public.extend_from_slice(&ALG_RSA.to_be_bytes());
+            public.extend_from_slice(&ALG_SHA256.to_be_bytes());
+            public.extend_from_slice(&EK_ATTRIBUTES.to_be_bytes());
+            public.extend_from_slice(&(EK_POLICY.len() as u16).to_be_bytes());
+            public.extend_from_slice(&EK_POLICY);
+            // TPMS_RSA_PARMS: AES-128-CFB symmetric, null scheme, 2048 bits, default exponent.
+            public.extend_from_slice(&ALG_AES.to_be_bytes());
+            public.extend_from_slice(&128u16.to_be_bytes());
+            public.extend_from_slice(&ALG_CFB.to_be_bytes());
+            public.extend_from_slice(&ALG_NULL.to_be_bytes());
+            public.extend_from_slice(&2048u16.to_be_bytes());
+            public.extend_from_slice(&0u32.to_be_bytes());
+            // unique: a 256-byte zero modulus, which the profile requires so the derived key is the standard EK.
+            public.extend_from_slice(&256u16.to_be_bytes());
+            public.extend_from_slice(&[0u8; 256]);
+
+            let mut body = Vec::new();
+            body.extend_from_slice(&RH_ENDORSEMENT.to_be_bytes());
+            // Authorization area: one password session, empty nonce, no attributes, empty password.
+            let auth: [u8; 9] = [0x40, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00];
+            debug_assert_eq!(&auth[..4], &RS_PW.to_be_bytes());
+            body.extend_from_slice(&(auth.len() as u32).to_be_bytes());
+            body.extend_from_slice(&auth);
+            // inSensitive: empty userAuth, empty data.
+            body.extend_from_slice(&4u16.to_be_bytes());
+            body.extend_from_slice(&[0u8; 4]);
+            // inPublic.
+            body.extend_from_slice(&(public.len() as u16).to_be_bytes());
+            body.extend_from_slice(&public);
+            // outsideInfo empty, creationPCR none.
+            body.extend_from_slice(&0u16.to_be_bytes());
+            body.extend_from_slice(&0u32.to_be_bytes());
+
+            let mut cmd = Vec::with_capacity(10 + body.len());
+            cmd.extend_from_slice(&ST_SESSIONS.to_be_bytes());
+            cmd.extend_from_slice(&((10 + body.len()) as u32).to_be_bytes());
+            cmd.extend_from_slice(&CC_CREATE_PRIMARY.to_be_bytes());
+            cmd.extend_from_slice(&body);
+            cmd
+        }
+
+        fn flush_context_command(handle: u32) -> [u8; 14] {
+            let mut cmd = [0u8; 14];
+            cmd[..2].copy_from_slice(&ST_NO_SESSIONS.to_be_bytes());
+            cmd[2..6].copy_from_slice(&14u32.to_be_bytes());
+            cmd[6..10].copy_from_slice(&CC_FLUSH_CONTEXT.to_be_bytes());
+            cmd[10..].copy_from_slice(&handle.to_be_bytes());
+            cmd
+        }
+
+        /// One command, one whole response (the resource manager answers a write with one read).
+        fn transact(dev: &mut std::fs::File, cmd: &[u8]) -> io::Result<Vec<u8>> {
+            dev.write_all(cmd)?;
+            let mut buf = vec![0u8; RESPONSE_CAPACITY];
+            let n = dev.read(&mut buf)?;
+            // WHY: the header is ten bytes and the chip's response code sits in it; anything shorter is a transport fault, not a TPM answer.
+            if n < 10 {
+                return Err(io::Error::other(format!("tpm: short response ({n} bytes)")));
+            }
+            buf.truncate(n);
+            let rc = u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]);
+            if rc != 0 {
+                return Err(io::Error::other(format!("tpm: response code {rc:#010x}")));
+            }
+            Ok(buf)
+        }
+
+        /// The outPublic TPM2B_PUBLIC bytes (size prefix included, the form `tpm2_createek -u` writes) from a CreatePrimary response, and the transient handle to flush.
+        pub(super) fn parse_create_primary(resp: &[u8]) -> io::Result<(u32, Vec<u8>)> {
+            // Header 10, objectHandle 4, parameterSize 4, then TPM2B_PUBLIC's own u16 size.
+            // WHY: the response is untrusted length-prefixed input from a device; a truncated or hostile reply must be an error, not a slice panic.
+            if resp.len() < 20 {
+                return Err(io::Error::other("tpm: CreatePrimary response too short"));
+            }
+            let handle = u32::from_be_bytes([resp[10], resp[11], resp[12], resp[13]]);
+            let size = u16::from_be_bytes([resp[18], resp[19]]) as usize;
+            let end = 20 + size;
+            if resp.len() < end {
+                return Err(io::Error::other("tpm: outPublic runs past the response"));
+            }
+            Ok((handle, resp[18..end].to_vec()))
+        }
+
+        /// `BLAKE3` of the endorsement key's marshalled public half, created and flushed in the same breath: nothing persists in the TPM or on disk.
+        /// Errors: no TPM (`NotFound`), no access (`PermissionDenied`, the user is not in `tss`), or the chip refusing the template (its response code).
+        pub fn tpm_plate() -> io::Result<[u8; 32]> {
+            let mut dev = std::fs::OpenOptions::new().read(true).write(true).open(DEVICE)?;
+            let resp = transact(&mut dev, &create_primary_ek_command())?;
+            let (handle, public) = parse_create_primary(&resp)?;
+            // The flush is owed whether or not the parse was happy; its failure is reported only if the plate itself succeeded.
+            let flushed = transact(&mut dev, &flush_context_command(handle));
+            flushed?;
+            Ok(*blake3::hash(&public).as_bytes())
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            /// The command's header, hierarchy, session and template fields sit exactly where Part 3 puts them; the sizes agree with the bytes that follow.
+            #[test]
+            fn ek_command_is_well_formed() {
+                let cmd = create_primary_ek_command();
+                assert_eq!(&cmd[..2], &ST_SESSIONS.to_be_bytes());
+                assert_eq!(u32::from_be_bytes([cmd[2], cmd[3], cmd[4], cmd[5]]) as usize, cmd.len());
+                assert_eq!(&cmd[6..10], &CC_CREATE_PRIMARY.to_be_bytes());
+                assert_eq!(&cmd[10..14], &RH_ENDORSEMENT.to_be_bytes());
+                assert_eq!(&cmd[14..18], &9u32.to_be_bytes());
+                assert_eq!(&cmd[18..22], &RS_PW.to_be_bytes());
+                // inSensitive at 27: size 4 then four zero bytes; inPublic size follows at 33.
+                assert_eq!(&cmd[27..29], &4u16.to_be_bytes());
+                let public_len = u16::from_be_bytes([cmd[33], cmd[34]]) as usize;
+                assert_eq!(&cmd[35..37], &ALG_RSA.to_be_bytes());
+                assert_eq!(&cmd[39..43], &EK_ATTRIBUTES.to_be_bytes());
+                // Template: 2 type + 2 nameAlg + 4 attributes + 2 + 32 policy + 2 + 2 + 2 + 2 + 2 + 4 parms + 2 + 256 unique.
+                assert_eq!(public_len, 2 + 2 + 4 + 2 + 32 + 2 + 2 + 2 + 2 + 2 + 4 + 2 + 256);
+                assert_eq!(cmd.len(), 35 + public_len + 2 + 4);
+            }
+
+            /// A response shorter than its own outPublic size is refused, and a well-formed one yields the handle and the size-prefixed public.
+            #[test]
+            fn create_primary_response_parses_or_refuses() {
+                let mut resp = vec![0u8; 18];
+                resp[..2].copy_from_slice(&ST_SESSIONS.to_be_bytes());
+                resp[10..14].copy_from_slice(&0x8000_0001u32.to_be_bytes());
+                resp.extend_from_slice(&3u16.to_be_bytes());
+                resp.extend_from_slice(&[7, 8]);
+                assert!(parse_create_primary(&resp).is_err(), "a short outPublic must be refused");
+                resp.push(9);
+                let (handle, public) = parse_create_primary(&resp).expect("whole");
+                assert_eq!(handle, 0x8000_0001);
+                assert_eq!(public, vec![0, 3, 7, 8, 9]);
+            }
+        }
+    }
+
     #[cfg(target_os = "windows")]
     pub fn machine_fingerprint() -> io::Result<Vec<u8>> {
         use std::process::Command;

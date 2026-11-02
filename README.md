@@ -43,6 +43,8 @@ Every app in the stack (Photon, Lumis, …) embeds tohu, passes its own constant
 | Android  | Widevine `deviceUniqueId` ‖ APK signing certificate ‖ `ANDROID_ID` via JNI | key per-(device, app-signing-key), secret from other apps, rotates on a wipe; the plate `BLAKE3(deviceUniqueId ‖ certificate)` names the phone thru the wipe |
 | other    | `/etc/hostid`, else `/etc/hostname` | best effort |
 
+On Linux a second value sits beside the root: `device::tpm_plate()`, `BLAKE3` of the TPM 2.0 endorsement key's public half, derived by the chip from its factory seed on every call and flushed at once (raw TPM commands over `/dev/tpmrm0`, no C library). It survives an OS reinstall and a TPM clear. It is absent until the user is in the `tss` group, and absent changes nothing. Nothing derives from it yet (docs/oracle-hardening.md).
+
 **Nothing here opens a socket.** Desktop reads a file or firmware fact; Android reads the Widevine device ID from the TEE over JNI, with no DRM session and so no provisioning round trip (verified in airplane mode on a Pixel 8 Pro, 2026-11-02). The crate's entire dependency list is `blake3`, `unicode-normalization`, `base64`, and `jni` (Android only) — none of which can reach the network. "tohu cannot exfiltrate your identity" is therefore something you can *verify by inspection*, not a promise you have to trust.
 
 ### Android
