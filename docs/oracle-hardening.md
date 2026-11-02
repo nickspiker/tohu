@@ -121,7 +121,7 @@ Android has nothing like the TPM's deterministic primaries: KeyMint never derive
   - Run both commands twice; the output must match. Then `tpm2_flushcontext -t`.
 - **Linux, TPM survives an OS reinstall:** compare the EK hash before and after a reinstall (or a live USB on the same machine).
 - **Windows:** the same `CreatePrimary` / `HMAC` sequence through TBS as a standard user, and whether `Get-TpmEndorsementKeyInfo` needs elevation.
-- **Android, Widevine:** BUILT 2026-11-02 as `device::widevine_id()` plus `device::signing_cert()`, called by photon's `widevine_probe()` at service start. It logs `widevine probe: id <blake3 prefix> (<n> bytes), level L1|L3, cdm <version>, plate(id ‖ signing cert) <blake3 prefix>`, or `unreadable (<exception>)`. Run it in airplane mode: a value there proves the read needs no network. Compare the prefixes:
+- **Android, Widevine:** BUILT 2026-11-02 as `device::widevine_id()` plus `device::signing_cert()`, called by photon's `widevine_probe()` at service start. It logs `widevine probe: id <blake3 prefix> (<n> bytes), level L1|L3, cdm <version>, plate(id ‖ signing cert) <blake3 prefix>`, or `unreadable (<exception>)`. Run it in airplane mode: a value there proves the read needs no network. First result, Pixel 8 Pro in airplane mode, 2026-11-02: 32-byte ID, level L1, CDM 19.5.0, so the read is local. Compare the prefixes:
   - across an app reinstall;
   - across two apps signed with our key;
   - across a factory reset of a spare device (not the daily Pixel unless the owner chooses to).
