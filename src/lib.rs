@@ -994,13 +994,13 @@ pub mod device {
     }
 
     #[cfg(target_os = "android")]
-    pub use android::android_init;
+    pub use android::{android_init, signing_cert, widevine_id, Widevine};
 
     // NEEDS ON-DEVICE TEST: this path only compiles under an android target and only runs on a device — it has NOT been executed. JNI calls target jni 0.21. The app `Context` is fetched via `ActivityThread.currentApplication()` so no Java-side change is needed; the only thing the app must do is hand tohu the JavaVM once via [`android_init`] (from its `JNI_OnLoad`). Build the APK to compile-verify before relying on it.
     #[cfg(target_os = "android")]
     mod android {
-        use jni::objects::{JString, JValue};
-        use jni::JavaVM;
+        use jni::objects::{JByteArray, JObject, JObjectArray, JString, JValue};
+        use jni::{AttachGuard, JNIEnv, JavaVM};
         use std::io;
         use std::string::{String, ToString};
         use std::sync::OnceLock;
@@ -1015,29 +1015,8 @@ pub mod device {
 
         /// `Settings.Secure.getString(ActivityThread.currentApplication().getContentResolver(), "android_id")`.
         pub fn android_id() -> io::Result<Vec<u8>> {
-            let vm = VM.get().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "tohu::device::android_init(vm) must be called (from JNI_OnLoad) before machine_fingerprint on Android",
-                )
-            })?;
-            let mut env = vm.attach_current_thread().map_err(jerr)?;
-            // Application context without a Java-side handoff.
-            let app = env
-                .call_static_method(
-                    "android/app/ActivityThread",
-                    "currentApplication",
-                    "()Landroid/app/Application;",
-                    &[],
-                )
-                .and_then(|v| v.l())
-                .map_err(jerr)?;
-            if app.is_null() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "ActivityThread.currentApplication() returned null (called before Application onCreate?)",
-                ));
-            }
+            let mut env = attach()?;
+            let app = app_context(&mut env)?;
             let resolver = env
                 .call_method(
                     &app,
@@ -1046,8 +1025,8 @@ pub mod device {
                     &[],
                 )
                 .and_then(|v| v.l())
-                .map_err(jerr)?;
-            let name = env.new_string("android_id").map_err(jerr)?;
+                .map_err(|e| jerr(&mut env, e))?;
+            let name = env.new_string("android_id").map_err(|e| jerr(&mut env, e))?;
             let value = env
                 .call_static_method(
                     "android/provider/Settings$Secure",
@@ -1056,13 +1035,183 @@ pub mod device {
                     &[JValue::Object(&resolver), JValue::Object(&name)],
                 )
                 .and_then(|v| v.l())
-                .map_err(jerr)?;
-            let s: String = env.get_string(&JString::from(value)).map_err(jerr)?.into();
+                .map_err(|e| jerr(&mut env, e))?;
+            let s: String = env.get_string(&JString::from(value)).map_err(|e| jerr(&mut env, e))?.into();
             Ok(s.into_bytes())
         }
 
-        fn jerr(e: jni::errors::Error) -> io::Error {
-            io::Error::new(io::ErrorKind::Other, e.to_string())
+        /// What the Widevine CDM reports about this device, read locally from the TEE with no permission and no network (docs/oracle-hardening.md).
+        pub struct Widevine {
+            /// `MediaDrm.PROPERTY_DEVICE_UNIQUE_ID`: the device credential's identifier, burned in at manufacture and expected to survive a factory reset.
+            pub device_unique_id: Vec<u8>,
+            /// `L1` (TEE-backed) or `L3` (software).
+            pub security_level: String,
+            /// The CDM version string.
+            pub version: String,
+        }
+
+        /// Read the Widevine device identity: `new MediaDrm(WIDEVINE_UUID)`, three property reads, `close()`.
+        /// No session is opened, so the provisioning round trip that a license session needs never happens.
+        /// A device without Widevine throws `UnsupportedSchemeException` from the constructor and lands here as an error.
+        pub fn widevine_id() -> io::Result<Widevine> {
+            let mut env = attach()?;
+            // edef8ba9-79d6-4ace-a3c8-27dcd51d21ed, the Widevine DRM scheme UUID, as the two halves `java.util.UUID(long, long)` takes.
+            let uuid = env
+                .new_object(
+                    "java/util/UUID",
+                    "(JJ)V",
+                    &[
+                        JValue::Long(0xEDEF8BA979D64ACEu64 as i64),
+                        JValue::Long(0xA3C827DCD51D21EDu64 as i64),
+                    ],
+                )
+                .map_err(|e| jerr(&mut env, e))?;
+            let drm = env
+                .new_object(
+                    "android/media/MediaDrm",
+                    "(Ljava/util/UUID;)V",
+                    &[JValue::Object(&uuid)],
+                )
+                .map_err(|e| jerr(&mut env, e))?;
+            let read = (|| -> io::Result<Widevine> {
+                let name = env.new_string("deviceUniqueId").map_err(|e| jerr(&mut env, e))?;
+                let id = env
+                    .call_method(
+                        &drm,
+                        "getPropertyByteArray",
+                        "(Ljava/lang/String;)[B",
+                        &[JValue::Object(&name)],
+                    )
+                    .and_then(|v| v.l())
+                    .map_err(|e| jerr(&mut env, e))?;
+                let device_unique_id = env
+                    .convert_byte_array(JByteArray::from(id))
+                    .map_err(|e| jerr(&mut env, e))?;
+                let security_level = property_string(&mut env, &drm, "securityLevel")?;
+                let version = property_string(&mut env, &drm, "version")?;
+                Ok(Widevine { device_unique_id, security_level, version })
+            })();
+            // Release the CDM instance whether or not the reads succeeded; the error of the reads is the one worth reporting.
+            let closed = env.call_method(&drm, "close", "()V", &[]).map_err(|e| jerr(&mut env, e));
+            let out = read?;
+            closed?;
+            Ok(out)
+        }
+
+        /// The DER bytes of the certificate this APK was signed with: `getPackageInfo(package, GET_SIGNING_CERTIFICATES).signingInfo.getApkContentsSigners()[0].toByteArray()`.
+        /// Every app in the family signs with the same key, so a plate folded with this is one value across them and another value for anyone else's build.
+        pub fn signing_cert() -> io::Result<Vec<u8>> {
+            let mut env = attach()?;
+            let app = app_context(&mut env)?;
+            let pm = env
+                .call_method(
+                    &app,
+                    "getPackageManager",
+                    "()Landroid/content/pm/PackageManager;",
+                    &[],
+                )
+                .and_then(|v| v.l())
+                .map_err(|e| jerr(&mut env, e))?;
+            let package = env
+                .call_method(&app, "getPackageName", "()Ljava/lang/String;", &[])
+                .and_then(|v| v.l())
+                .map_err(|e| jerr(&mut env, e))?;
+            // PackageManager.GET_SIGNING_CERTIFICATES.
+            let flags = JValue::Int(1 << 27);
+            let info = env
+                .call_method(
+                    &pm,
+                    "getPackageInfo",
+                    "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;",
+                    &[JValue::Object(&package), flags],
+                )
+                .and_then(|v| v.l())
+                .map_err(|e| jerr(&mut env, e))?;
+            let signing = env
+                .get_field(&info, "signingInfo", "Landroid/content/pm/SigningInfo;")
+                .and_then(|v| v.l())
+                .map_err(|e| jerr(&mut env, e))?;
+            let signers = env
+                .call_method(
+                    &signing,
+                    "getApkContentsSigners",
+                    "()[Landroid/content/pm/Signature;",
+                    &[],
+                )
+                .and_then(|v| v.l())
+                .map_err(|e| jerr(&mut env, e))?;
+            let signers = JObjectArray::from(signers);
+            // An installed APK always carries at least one signer, so element 0 exists.
+            let first = env
+                .get_object_array_element(&signers, 0)
+                .map_err(|e| jerr(&mut env, e))?;
+            let der = env
+                .call_method(&first, "toByteArray", "()[B", &[])
+                .and_then(|v| v.l())
+                .map_err(|e| jerr(&mut env, e))?;
+            env.convert_byte_array(JByteArray::from(der)).map_err(|e| jerr(&mut env, e))
+        }
+
+        fn property_string(env: &mut JNIEnv, drm: &JObject, name: &str) -> io::Result<String> {
+            let name = env.new_string(name).map_err(|e| jerr(env, e))?;
+            let value = env
+                .call_method(
+                    drm,
+                    "getPropertyString",
+                    "(Ljava/lang/String;)Ljava/lang/String;",
+                    &[JValue::Object(&name)],
+                )
+                .and_then(|v| v.l())
+                .map_err(|e| jerr(env, e))?;
+            Ok(env.get_string(&JString::from(value)).map_err(|e| jerr(env, e))?.into())
+        }
+
+        fn attach() -> io::Result<AttachGuard<'static>> {
+            let vm = VM.get().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "tohu::device::android_init(vm) must be called (from JNI_OnLoad) before machine_fingerprint on Android",
+                )
+            })?;
+            vm.attach_current_thread().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        }
+
+        /// The Application context without a Java-side handoff.
+        fn app_context<'a>(env: &mut JNIEnv<'a>) -> io::Result<JObject<'a>> {
+            let app = env
+                .call_static_method(
+                    "android/app/ActivityThread",
+                    "currentApplication",
+                    "()Landroid/app/Application;",
+                    &[],
+                )
+                .and_then(|v| v.l())
+                .map_err(|e| jerr(env, e))?;
+            if app.is_null() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "ActivityThread.currentApplication() returned null (called before Application onCreate?)",
+                ));
+            }
+            Ok(app)
+        }
+
+        /// Turn a JNI failure into an io::Error, carrying the Java exception's text when one is pending and clearing it so the thread can return to Java.
+        fn jerr(env: &mut JNIEnv, e: jni::errors::Error) -> io::Error {
+            let text = match e {
+                jni::errors::Error::JavaException => match env.exception_occurred() {
+                    Ok(t) => {
+                        let _ = env.exception_clear();
+                        env.call_method(&t, "toString", "()Ljava/lang/String;", &[])
+                            .and_then(|v| v.l())
+                            .and_then(|s| env.get_string(&JString::from(s)).map(String::from))
+                            .unwrap_or_else(|_| "Java exception".to_string())
+                    }
+                    Err(_) => "Java exception".to_string(),
+                },
+                e => e.to_string(),
+            };
+            io::Error::new(io::ErrorKind::Other, text)
         }
     }
 }
