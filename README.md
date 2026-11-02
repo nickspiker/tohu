@@ -108,7 +108,7 @@ let health = tohu::decode_health(&tohu::pipe(&tohu::HEALTH_CHALLENGE)?);
 
 ## Status
 
-`v0` — the derivation primitives are frozen (a snapshot test guards them: if any output shifts, every existing vault on every device becomes unreachable). The device oracle is an interim; the endgame is a hardware identity device, slotted in behind the same `device_secret` boundary with no change to callers.
+`v0` — the derivation primitives are frozen (a snapshot test guards them: if any output shifts, every existing vault on every device becomes unreachable). The device oracle is an interim; the endgame is a hardware identity device, slotted in behind the same `device_secret` boundary with no change to callers. The root is deliberately ONE stable value per device, never salted per handle, randomised per install, rotated or kept in a keystore: that stability is the anti-sybil core, and it is what keeps a stolen device recognisable. What each platform offers beyond today's oracle, under those rules (nothing stored, one device one plate), is scoped in [docs/oracle-hardening.md](docs/oracle-hardening.md).
 
 ## Terminology
 
