@@ -928,6 +928,25 @@ pub mod device {
         *blake3::hash(raw).as_bytes()
     }
 
+    /// This hardware's PLATE: a stable public name that survives a wipe where the key does not, and from which the key cannot be computed (docs/oracle-hardening.md).
+    /// Android: `BLAKE3(Widevine id ‖ signing certificate)`; Linux: `BLAKE3` of the TPM endorsement key, when the user may open the chip.
+    /// Every other platform answers `None`: there the only stable fact is the root itself, and publishing its hash would publish the device secret.
+    /// Read fresh each call and never stored; the Linux read asks the chip, which takes up to a second, so callers run it off the UI thread.
+    pub fn plate() -> Option<[u8; 32]> {
+        #[cfg(target_os = "android")]
+        {
+            android_plate().ok()
+        }
+        #[cfg(target_os = "linux")]
+        {
+            tpm_plate().ok()
+        }
+        #[cfg(not(any(target_os = "android", target_os = "linux")))]
+        {
+            None
+        }
+    }
+
     /// The raw platform device fact (hashed into [`device_secret`]):
     /// Linux `/etc/machine-id` · Windows registry `MachineGuid` · macOS `IOPlatformUUID` (firmware, survives reinstall) · Android Widevine `deviceUniqueId` ‖ APK signing certificate via JNI (needs [`android_init`] and [`android_select_root`]; legacy `ANDROID_ID` under the conversion pin until v168) · other: `/etc/hostid` then `/etc/hostname`.
     #[cfg(target_os = "linux")]
