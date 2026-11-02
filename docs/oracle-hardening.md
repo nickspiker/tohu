@@ -110,12 +110,8 @@ Android has nothing like the TPM's deterministic primaries: KeyMint never derive
 
 ## Verification still to do
 
-- **Linux, EK is deterministic and readable without storage:** run as root, or as a user in `tss`:
-  - `tpm2_createek -c - -G rsa -u ek1.pub`
-  - `tpm2_createek -c - -G rsa -u ek2.pub`
-  - `cmp ek1.pub ek2.pub` (identical, nothing persisted, since `-c -` means no persistent handle)
-  - `tpm2_getekcertificate -u ek1.pub -o ek.crt` (for the AMD fTPM, this fetches from AMD)
-  - `b3sum ek1.pub` must equal the plate photon logs at startup (`device plate: tpm <prefix>`): the same template, the same marshalled public, so the same hash
+- **Linux, EK is deterministic and readable without storage: VERIFIED 2026-11-02** on an AMD fTPM (Ryzen 9 5950X) as a user in `tss`. Two `tpm2_createek -G rsa -u` runs gave identical files, and `b3sum` of that file equalled `tohu::device::tpm_plate()` run against the same chip, byte for byte: the template, the marshalling and the parse all agree with the reference tool. Caution: `tpm2_createek -c -` PERSISTS the key (it printed `persistent-handle: 0x81000000` and `0x81000003`, evicted afterwards with `tpm2_evictcontrol -C o -c <handle>`); use `-c ek.ctx` for a transient context instead. tohu's own path persists nothing (CreatePrimary then FlushContext).
+  - `tpm2_getekcertificate -u ek1.pub -o ek.crt` (for the AMD fTPM, this fetches from AMD): not yet run, only the answered form needs it.
 - **Linux, HMAC primary is deterministic:**
   - `tpm2_createprimary -C e -G hmac -c hm.ctx`
   - `echo -n probe | tpm2_hmac -c hm.ctx`
