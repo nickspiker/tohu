@@ -936,7 +936,7 @@ pub mod device {
     }
 
     #[cfg(target_os = "linux")]
-    pub use tpm::tpm_plate;
+    pub use tpm::{tpm_hmac, tpm_plate, tpm_root};
 
     /// The TPM 2.0 plate on Linux (docs/oracle-hardening.md): the endorsement key's public half, derived by the chip from its endorsement seed every time it is asked, so nothing is stored anywhere; hashed into 32 bytes.
     /// It survives an OS reinstall and a TPM clear, and only a firmware TPM reset or a logic board swap changes it. It is reported, not answered: a plate, not a proof.
@@ -1066,6 +1066,105 @@ pub mod device {
             Ok(*blake3::hash(&public).as_bytes())
         }
 
+        const CC_HMAC: u32 = 0x0000_0155;
+        const ALG_KEYEDHASH: u16 = 0x0008;
+        const ALG_HMAC: u16 = 0x0005;
+        /// fixedTPM | fixedParent | sensitiveDataOrigin | userWithAuth | noDA | sign: a keyed-hash primary that only signs, never leaves the chip, and answers to the empty password.
+        const HMAC_ATTRIBUTES: u32 = 0x0004_0472;
+        /// Our own authorization policy digest for the key's template: no policy is ever satisfied against it (userWithAuth is the path used), it only makes the derived key ours and not some other application's keyed-hash primary.
+        const HMAC_POLICY: [u8; 32] = *b"tohu.tpm.hmac-primary.v0\0\0\0\0\0\0\0\0";
+        /// What the key is asked to answer when it is the device root: a fixed label, so the root is one value per chip for this application.
+        const ROOT_LABEL: &[u8] = b"tohu.device-root.v0";
+
+        /// `TPM2_CreatePrimary` under the endorsement hierarchy with the keyed-hash (HMAC-SHA256) template, same marshalling as the EK command, a different template.
+        pub(super) fn create_primary_hmac_command() -> Vec<u8> {
+            let mut public = Vec::new();
+            public.extend_from_slice(&ALG_KEYEDHASH.to_be_bytes());
+            public.extend_from_slice(&ALG_SHA256.to_be_bytes());
+            public.extend_from_slice(&HMAC_ATTRIBUTES.to_be_bytes());
+            public.extend_from_slice(&(HMAC_POLICY.len() as u16).to_be_bytes());
+            public.extend_from_slice(&HMAC_POLICY);
+            // TPMS_KEYEDHASH_PARMS: scheme HMAC with SHA256.
+            public.extend_from_slice(&ALG_HMAC.to_be_bytes());
+            public.extend_from_slice(&ALG_SHA256.to_be_bytes());
+            // unique: an empty digest.
+            public.extend_from_slice(&0u16.to_be_bytes());
+            create_primary_with(&public)
+        }
+
+        /// The CreatePrimary envelope around any template: hierarchy, empty password session, empty sensitive, the template, no outside info, no creation PCRs.
+        fn create_primary_with(public: &[u8]) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.extend_from_slice(&RH_ENDORSEMENT.to_be_bytes());
+            let auth: [u8; 9] = [0x40, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00];
+            body.extend_from_slice(&(auth.len() as u32).to_be_bytes());
+            body.extend_from_slice(&auth);
+            body.extend_from_slice(&4u16.to_be_bytes());
+            body.extend_from_slice(&[0u8; 4]);
+            body.extend_from_slice(&(public.len() as u16).to_be_bytes());
+            body.extend_from_slice(public);
+            body.extend_from_slice(&0u16.to_be_bytes());
+            body.extend_from_slice(&0u32.to_be_bytes());
+            let mut cmd = Vec::with_capacity(10 + body.len());
+            cmd.extend_from_slice(&ST_SESSIONS.to_be_bytes());
+            cmd.extend_from_slice(&((10 + body.len()) as u32).to_be_bytes());
+            cmd.extend_from_slice(&CC_CREATE_PRIMARY.to_be_bytes());
+            cmd.extend_from_slice(&body);
+            cmd
+        }
+
+        /// `TPM2_HMAC(handle, message)` with SHA256 (Part 3 §15.4), password session with the empty password.
+        pub(super) fn hmac_command(handle: u32, message: &[u8]) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.extend_from_slice(&handle.to_be_bytes());
+            let auth: [u8; 9] = [0x40, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00];
+            body.extend_from_slice(&(auth.len() as u32).to_be_bytes());
+            body.extend_from_slice(&auth);
+            // TPM2B_MAX_BUFFER: one buffer of at most 1024 bytes; the callers' messages are short labels and 32-byte challenges.
+            body.extend_from_slice(&(message.len() as u16).to_be_bytes());
+            body.extend_from_slice(message);
+            body.extend_from_slice(&ALG_SHA256.to_be_bytes());
+            let mut cmd = Vec::with_capacity(10 + body.len());
+            cmd.extend_from_slice(&ST_SESSIONS.to_be_bytes());
+            cmd.extend_from_slice(&((10 + body.len()) as u32).to_be_bytes());
+            cmd.extend_from_slice(&CC_HMAC.to_be_bytes());
+            cmd.extend_from_slice(&body);
+            cmd
+        }
+
+        /// The 32-byte tag from an HMAC response: header 10, parameterSize 4, then TPM2B_DIGEST (size 32, bytes).
+        pub(super) fn parse_hmac(resp: &[u8]) -> io::Result<[u8; 32]> {
+            // WHY: a device answer of the wrong shape is a transport or firmware fault; the slice below must never panic on it.
+            if resp.len() < 16 + 32 || u16::from_be_bytes([resp[14], resp[15]]) != 32 {
+                return Err(io::Error::other("tpm: HMAC response is not a 32-byte digest"));
+            }
+            let mut tag = [0u8; 32];
+            tag.copy_from_slice(&resp[16..48]);
+            Ok(tag)
+        }
+
+        /// The chip's answer to `message` under its keyed-hash primary: derived from the endorsement seed on every call, used, flushed. The secret never leaves the chip, so there is nothing to copy off the machine.
+        /// This is PIPE's `attest(challenge)` shape with the TPM as the silicon: symmetric, so only a holder of the same chip can check it, which makes it a local root, not a remote proof, until the answered form certifies the key.
+        pub fn tpm_hmac(message: &[u8]) -> io::Result<[u8; 32]> {
+            // WHY: TPM2B_MAX_BUFFER carries at most 1024 bytes and a u16 length; a longer message is a caller error, said so rather than truncated.
+            if message.len() > 1 << 10 {
+                return Err(io::Error::other("tpm: HMAC message longer than one TPM buffer"));
+            }
+            let mut dev = std::fs::OpenOptions::new().read(true).write(true).open(DEVICE)?;
+            let resp = transact(&mut dev, &create_primary_hmac_command())?;
+            let (handle, _) = parse_create_primary(&resp)?;
+            let answer = transact(&mut dev, &hmac_command(handle, message)).and_then(|r| parse_hmac(&r));
+            let flushed = transact(&mut dev, &flush_context_command(handle));
+            let tag = answer?;
+            flushed?;
+            Ok(tag)
+        }
+
+        /// The TPM key root: the chip's HMAC over a fixed label, one value per chip for this application, nothing stored. The candidate successor to `machine-id` as what `device_secret` hashes.
+        pub fn tpm_root() -> io::Result<[u8; 32]> {
+            tpm_hmac(ROOT_LABEL)
+        }
+
         #[cfg(test)]
         mod tests {
             use super::*;
@@ -1088,6 +1187,31 @@ pub mod device {
                 // Template: 2 type + 2 nameAlg + 4 attributes + 2 + 32 policy + 2 + 2 + 2 + 2 + 2 + 4 parms + 2 + 256 unique.
                 assert_eq!(public_len, 2 + 2 + 4 + 2 + 32 + 2 + 2 + 2 + 2 + 2 + 4 + 2 + 256);
                 assert_eq!(cmd.len(), 35 + public_len + 2 + 4);
+            }
+
+            /// The keyed-hash template and the HMAC command sit where Part 3 puts them; a digest response of the wrong size is refused.
+            #[test]
+            fn hmac_commands_are_well_formed() {
+                let cmd = create_primary_hmac_command();
+                assert_eq!(u32::from_be_bytes([cmd[2], cmd[3], cmd[4], cmd[5]]) as usize, cmd.len());
+                let public_len = u16::from_be_bytes([cmd[33], cmd[34]]) as usize;
+                assert_eq!(&cmd[35..37], &ALG_KEYEDHASH.to_be_bytes());
+                assert_eq!(&cmd[39..43], &HMAC_ATTRIBUTES.to_be_bytes());
+                // Template: 2 type + 2 nameAlg + 4 attributes + 2 + 32 policy + 2 scheme + 2 hash + 2 empty unique.
+                assert_eq!(public_len, 2 + 2 + 4 + 2 + 32 + 2 + 2 + 2);
+                let h = hmac_command(0x8000_0002, b"abc");
+                assert_eq!(&h[6..10], &CC_HMAC.to_be_bytes());
+                assert_eq!(&h[10..14], &0x8000_0002u32.to_be_bytes());
+                assert_eq!(&h[27..29], &3u16.to_be_bytes());
+                assert_eq!(&h[29..32], b"abc");
+                assert_eq!(&h[32..34], &ALG_SHA256.to_be_bytes());
+                assert_eq!(u32::from_be_bytes([h[2], h[3], h[4], h[5]]) as usize, h.len());
+                let mut resp = vec![0u8; 14];
+                resp.extend_from_slice(&31u16.to_be_bytes());
+                resp.extend_from_slice(&[1u8; 32]);
+                assert!(parse_hmac(&resp).is_err(), "a 31-byte digest must be refused");
+                resp[14..16].copy_from_slice(&32u16.to_be_bytes());
+                assert_eq!(parse_hmac(&resp).expect("digest"), [1u8; 32]);
             }
 
             /// A response shorter than its own outPublic size is refused, and a well-formed one yields the handle and the size-prefixed public.
