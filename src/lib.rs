@@ -989,7 +989,7 @@ pub mod device {
     }
 
     /// Android: the root the app selected with [`android_select_root`], read fresh each call.
-    /// Widevine's device ID ‖ the APK signing certificate is the root (Nick 2026-11-02: "we just found the ira"); it is burned in at manufacture and survives a factory reset, which `ANDROID_ID` does not.
+    /// Widevine's device ID ‖ the APK signing certificate ‖ `ANDROID_ID` is the key root (Nick 2026-11-02); the first two name the phone for good ([`android_plate`]), the third keeps the key secret from other apps and rotates it on a wipe.
     /// ANDROID ROOT CONVERSION PIN, delete at v168: a vault founded under the `ANDROID_ID` root keeps that root until converted, so the legacy source stays selectable for thirty versions after v138.
     #[cfg(target_os = "android")]
     pub fn machine_fingerprint() -> io::Result<Vec<u8>> {
@@ -1003,14 +1003,14 @@ pub mod device {
     #[cfg(target_os = "android")]
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum AndroidRoot {
-        /// Widevine `deviceUniqueId` ‖ APK signing certificate: factory-reset-proof, scoped to the app family.
+        /// Widevine `deviceUniqueId` ‖ APK signing certificate ‖ `ANDROID_ID`: the plate part names the phone thru a wipe, the `ANDROID_ID` part keeps the key per signer and rotates it on a wipe.
         Widevine,
         /// `Settings.Secure.ANDROID_ID`: the root every Android vault was founded under before v139. Conversion pin, delete at v168.
         LegacyAndroidId,
     }
 
     #[cfg(target_os = "android")]
-    pub use android::{android_id, android_init, android_root, android_select_root, signing_cert, widevine_id, widevine_root, widevine_root_parts, Widevine};
+    pub use android::{android_id, android_init, android_plate, android_root, android_select_root, signing_cert, widevine_id, widevine_root, widevine_root_parts, Widevine};
 
     // NEEDS ON-DEVICE TEST: this path only compiles under an android target and only runs on a device — it has NOT been executed. JNI calls target jni 0.21. The app `Context` is fetched via `ActivityThread.currentApplication()` so no Java-side change is needed; the only thing the app must do is hand tohu the JavaVM once via [`android_init`] (from its `JNI_OnLoad`). Build the APK to compile-verify before relying on it.
     #[cfg(target_os = "android")]
@@ -1050,17 +1050,27 @@ pub mod device {
             })
         }
 
-        /// The Widevine root: `deviceUniqueId` ‖ the APK signing certificate's DER, so the plate is one value across the app family and another for anyone else's build.
+        /// The Widevine root, the KEY: `deviceUniqueId` ‖ the APK signing certificate's DER ‖ `ANDROID_ID`.
+        /// The Widevine ID is readable by every app on the phone (tested 2026-11-02), so on its own any app could compute this app's device secret; `ANDROID_ID` is scoped per signing key, so folding it in keeps the key secret from other apps. It also rotates on a factory wipe, so the key does too, and the owner pairs the wiped phone again as before.
+        /// The device itself is named by [`android_plate`], which has no `ANDROID_ID` in it and survives the wipe: the car keeps its plate, the key stays in the owner's pocket (Nick 2026-11-02).
         /// The error is an error: a transient CDM failure must never flip a device onto a different root, so nothing here falls back.
         pub fn widevine_root() -> io::Result<Vec<u8>> {
-            let (mut root, cert) = widevine_root_parts()?;
+            let (mut root, cert, android_id) = widevine_root_parts()?;
             root.extend_from_slice(&cert);
+            root.extend_from_slice(&android_id);
             Ok(root)
         }
 
-        /// The two parts of [`widevine_root`], the device ID and the certificate, apart: for an app that logs or compares the hardware part on its own.
-        pub fn widevine_root_parts() -> io::Result<(Vec<u8>, Vec<u8>)> {
-            Ok((widevine_id()?.device_unique_id, signing_cert()?))
+        /// The three parts of [`widevine_root`] apart: the Widevine device ID, the signing certificate, and `ANDROID_ID`.
+        pub fn widevine_root_parts() -> io::Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+            Ok((widevine_id()?.device_unique_id, signing_cert()?, android_id()?))
+        }
+
+        /// The PLATE: `BLAKE3(deviceUniqueId ‖ signing certificate)`, the stable public name of this phone for this app family. It survives a factory wipe and an OS reinstall; only a logic board swap changes it.
+        /// Published beside the device key so a fleet or the phonebook can recognise a wiped phone that comes back under a new key, and refuse a plate reported stolen. A reported value, like every root until PIPE.
+        pub fn android_plate() -> io::Result<[u8; 32]> {
+            let (id, cert, _) = widevine_root_parts()?;
+            Ok(*blake3::hash(&[id, cert].concat()).as_bytes())
         }
 
         /// `Settings.Secure.getString(ActivityThread.currentApplication().getContentResolver(), "android_id")`.

@@ -40,14 +40,14 @@ Every app in the stack (Photon, Lumis, …) embeds tohu, passes its own constant
 | Linux    | `/etc/machine-id` | per-install |
 | Windows  | registry `MachineGuid` | per-install |
 | macOS    | `IOPlatformUUID` | firmware — survives reinstall |
-| Android  | Widevine `deviceUniqueId` ‖ APK signing certificate via JNI | per-(device, app-signing-key); burned in, survives a factory reset |
+| Android  | Widevine `deviceUniqueId` ‖ APK signing certificate ‖ `ANDROID_ID` via JNI | key per-(device, app-signing-key), secret from other apps, rotates on a wipe; the plate `BLAKE3(deviceUniqueId ‖ certificate)` names the phone thru the wipe |
 | other    | `/etc/hostid`, else `/etc/hostname` | best effort |
 
 **Nothing here opens a socket.** Desktop reads a file or firmware fact; Android reads the Widevine device ID from the TEE over JNI, with no DRM session and so no provisioning round trip (verified in airplane mode on a Pixel 8 Pro, 2026-11-02). The crate's entire dependency list is `blake3`, `unicode-normalization`, `base64`, and `jni` (Android only) — none of which can reach the network. "tohu cannot exfiltrate your identity" is therefore something you can *verify by inspection*, not a promise you have to trust.
 
 ### Android
 
-Android denies native code a stable hardware identifier, so the root lives behind Java APIs: `MediaDrm` for the Widevine device ID (burned in at manufacture, Google-issued but read with no Google in the loop) and `PackageManager` for the signing certificate. tohu reads both itself — hand it the `JavaVM` once from your `JNI_OnLoad`, select the root once with `android_select_root` (the app keeps whichever root its device vault was founded under; the legacy `ANDROID_ID` root stays selectable under a conversion pin until v168), and it resolves the application `Context` via `ActivityThread.currentApplication()` (no Java-side change required):
+Android denies native code a stable hardware identifier, so the root lives behind Java APIs: `MediaDrm` for the Widevine device ID (burned in at manufacture, Google-issued but read with no Google in the loop), `PackageManager` for the signing certificate, and `Settings.Secure` for `ANDROID_ID`. The Widevine ID is readable by every app on the phone, so the key folds in `ANDROID_ID`, which Android scopes per signing key; the plate (`android_plate`) leaves it out and so survives a factory wipe while the key rotates. tohu reads both itself — hand it the `JavaVM` once from your `JNI_OnLoad`, select the root once with `android_select_root` (the app keeps whichever root its device vault was founded under; the legacy `ANDROID_ID` root stays selectable under a conversion pin until v168), and it resolves the application `Context` via `ActivityThread.currentApplication()` (no Java-side change required):
 
 ```rust
 // in your #[no_mangle] JNI_OnLoad:
