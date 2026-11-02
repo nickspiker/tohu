@@ -40,14 +40,14 @@ Every app in the stack (Photon, Lumis, …) embeds tohu, passes its own constant
 | Linux    | `/etc/machine-id` | per-install |
 | Windows  | registry `MachineGuid` | per-install |
 | macOS    | `IOPlatformUUID` | firmware — survives reinstall |
-| Android  | `Settings.Secure.ANDROID_ID` via JNI | per-(device, user, app-signing-key) |
+| Android  | Widevine `deviceUniqueId` ‖ APK signing certificate via JNI | per-(device, app-signing-key); burned in, survives a factory reset |
 | other    | `/etc/hostid`, else `/etc/hostname` | best effort |
 
-**Nothing here opens a socket.** Desktop reads a file or firmware fact; Android reads ANDROID_ID over JNI. The crate's entire dependency list is `blake3`, `unicode-normalization`, `base64`, and `jni` (Android only) — none of which can reach the network. "tohu cannot exfiltrate your identity" is therefore something you can *verify by inspection*, not a promise you have to trust.
+**Nothing here opens a socket.** Desktop reads a file or firmware fact; Android reads the Widevine device ID from the TEE over JNI, with no DRM session and so no provisioning round trip (verified in airplane mode on a Pixel 8 Pro, 2026-11-02). The crate's entire dependency list is `blake3`, `unicode-normalization`, `base64`, and `jni` (Android only) — none of which can reach the network. "tohu cannot exfiltrate your identity" is therefore something you can *verify by inspection*, not a promise you have to trust.
 
 ### Android
 
-Android denies native code a stable hardware identifier, so the unique value (`ANDROID_ID`) lives behind a Java API. tohu reads it itself — hand it the `JavaVM` once from your `JNI_OnLoad`, and it resolves the application `Context` via `ActivityThread.currentApplication()` (no Java-side change required):
+Android denies native code a stable hardware identifier, so the root lives behind Java APIs: `MediaDrm` for the Widevine device ID (burned in at manufacture, Google-issued but read with no Google in the loop) and `PackageManager` for the signing certificate. tohu reads both itself — hand it the `JavaVM` once from your `JNI_OnLoad`, select the root once with `android_select_root` (the app keeps whichever root its device vault was founded under; the legacy `ANDROID_ID` root stays selectable under a conversion pin until v168), and it resolves the application `Context` via `ActivityThread.currentApplication()` (no Java-side change required):
 
 ```rust
 // in your #[no_mangle] JNI_OnLoad:
@@ -102,7 +102,7 @@ let health = tohu::decode_health(&tohu::pipe(&tohu::HEALTH_CHALLENGE)?);
 
 ## Uniqueness
 
-`device_secret` carries exactly the oracle's entropy. `ANDROID_ID` is 64-bit, so an accidental two-device collision is birthday-bound at ~5 billion installs (`√(2·2⁶⁴·ln 2)`) — more than every Android device on Earth, and well past where hardware identity supersedes this oracle. And the provided derivations (`vault_path_name` / `vault_anchor_key`) fold `handle_seed` in regardless, so identities separate by handle even then. Not a concern at realistic scale; the collision-free root is hardware.
+`device_secret` carries exactly the oracle's entropy. The Widevine device ID is 256-bit. The legacy `ANDROID_ID` root was 64-bit, so an accidental two-device collision there is birthday-bound at ~5 billion installs (`√(2·2⁶⁴·ln 2)`) — more than every Android device on Earth. And the provided derivations (`vault_path_name` / `vault_anchor_key`) fold `handle_seed` in regardless, so identities separate by handle even then. Not a concern at realistic scale; the collision-free root is hardware.
 
 ---
 

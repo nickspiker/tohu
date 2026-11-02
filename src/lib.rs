@@ -1,7 +1,7 @@
 //! tohu — device identity for the TOKEN/FGTW app stack. The sign (Māori *tohu*) drawn from the formless (Hebrew *tohu*): a stable, device-bound secret read from the platform, then frozen v0 key derivation on top.
 //!
 //! Two layers:
-//!   * [`device`] (std only) — the per-platform device oracle. Reads the strongest device-bound fact each platform allows and returns it as `device_secret`. Desktop reads a firmware/install fact directly; Android reads `Settings.Secure.ANDROID_ID` itself via a JavaVM + Context the app hands in once ([`device::android_init`]). No networking on any platform — auditable by inspection. This is the seam PIPE slots into later: swap the source, the derivation below is untouched.
+//!   * [`device`] (std only) — the per-platform device oracle. Reads the strongest device-bound fact each platform allows and returns it as `device_secret`. Desktop reads a firmware/install fact directly; Android reads the Widevine device ID and the APK signing certificate itself via a JavaVM the app hands in once ([`device::android_init`]), after the app selects the root ([`device::android_select_root`]). No networking on any platform — auditable by inspection. This is the seam PIPE slots into later: swap the source, the derivation below is untouched.
 //!   * the frozen derivation primitives ([`handle_seed`], [`vault_path_name`], [`vault_anchor_key`], [`attest_with`]) — pure, `no_std`. Every app in the stack (Photon, Lumis, ...) derives its own per-user per-device material from these. [`pipe`] is the bitwise 256-in / 256-out interface that mirrors the PIPE wire and that hardware later replaces verbatim: a non-zero challenge attests (binds the input to the device), and the all-zeros [`HEALTH_CHALLENGE`] returns a [`HealthState`] (`hardware: false` under software emulation). The version suffix (`v0`) is baked into every context string; bumping requires a coordinated stack migration.
 //!
 //! # Pipeline
@@ -910,9 +910,9 @@ fn base64url_encode(bytes: &[u8]) -> String {
 
 /// The per-platform device oracle and `device_secret` (std only). The source of the device fact is the only thing that varies by platform — and the only thing PIPE later replaces; the derivation above is identical everywhere.
 ///
-/// Nothing here opens a socket. Desktop reads a file / firmware fact; Android reads `Settings.Secure.ANDROID_ID` over JNI. Both local. The crate's deps (blake3, unicode-normalization, base64, and jni on Android only) contain nothing that can reach the network, so "tohu cannot exfiltrate your identity" is verifiable from the dependency list, not asserted.
+/// Nothing here opens a socket. Desktop reads a file / firmware fact; Android reads the Widevine device ID from the TEE over JNI, with no DRM session and so no provisioning round trip. Both local. The crate's deps (blake3, unicode-normalization, base64, and jni on Android only) contain nothing that can reach the network, so "tohu cannot exfiltrate your identity" is verifiable from the dependency list, not asserted.
 ///
-/// UNIQUENESS — `device_secret` carries the oracle's entropy. `ANDROID_ID` is 64-bit, so an accidental two-device collision is birthday-bound at ~5 billion installs — past every Android device on Earth, and past where hardware identity supersedes this oracle. And the provided derivations ([`vault_path_name`] / [`vault_anchor_key`]) fold `handle_seed` in regardless, so identities separate by handle even then. Not a concern at realistic scale; the collision-free root is hardware (PIPE).
+/// UNIQUENESS — `device_secret` carries the oracle's entropy. The Widevine device ID is 256-bit; the legacy `ANDROID_ID` was 64-bit, so an accidental two-device collision there is birthday-bound at ~5 billion installs — past every Android device on Earth. And the provided derivations ([`vault_path_name`] / [`vault_anchor_key`]) fold `handle_seed` in regardless, so identities separate by handle even then. Not a concern at realistic scale; the collision-free root is hardware (PIPE).
 #[cfg(feature = "std")]
 pub mod device {
     use std::io;
@@ -929,7 +929,7 @@ pub mod device {
     }
 
     /// The raw platform device fact (hashed into [`device_secret`]):
-    /// Linux `/etc/machine-id` · Windows registry `MachineGuid` · macOS `IOPlatformUUID` (firmware, survives reinstall) · Android `Settings.Secure.ANDROID_ID` via JNI (needs [`android_init`]) · other: `/etc/hostid` then `/etc/hostname`.
+    /// Linux `/etc/machine-id` · Windows registry `MachineGuid` · macOS `IOPlatformUUID` (firmware, survives reinstall) · Android Widevine `deviceUniqueId` ‖ APK signing certificate via JNI (needs [`android_init`] and [`android_select_root`]; legacy `ANDROID_ID` under the conversion pin until v168) · other: `/etc/hostid` then `/etc/hostname`.
     #[cfg(target_os = "linux")]
     pub fn machine_fingerprint() -> io::Result<Vec<u8>> {
         std::fs::read("/etc/machine-id")
@@ -988,13 +988,29 @@ pub mod device {
         Ok(std::fs::read("/etc/hostname").unwrap_or_else(|_| b"unknown".to_vec()))
     }
 
+    /// Android: the root the app selected with [`android_select_root`], read fresh each call.
+    /// Widevine's device ID ‖ the APK signing certificate is the root (Nick 2026-11-02: "we just found the ira"); it is burned in at manufacture and survives a factory reset, which `ANDROID_ID` does not.
+    /// ANDROID ROOT CONVERSION PIN, delete at v168: a vault founded under the `ANDROID_ID` root keeps that root until converted, so the legacy source stays selectable for thirty versions after v138.
     #[cfg(target_os = "android")]
     pub fn machine_fingerprint() -> io::Result<Vec<u8>> {
-        android::android_id()
+        match android::selected_root()? {
+            AndroidRoot::Widevine => android::widevine_root(),
+            AndroidRoot::LegacyAndroidId => android::android_id(),
+        }
+    }
+
+    /// Which source feeds `device_secret` on Android.
+    #[cfg(target_os = "android")]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum AndroidRoot {
+        /// Widevine `deviceUniqueId` ‖ APK signing certificate: factory-reset-proof, scoped to the app family.
+        Widevine,
+        /// `Settings.Secure.ANDROID_ID`: the root every Android vault was founded under before v139. Conversion pin, delete at v168.
+        LegacyAndroidId,
     }
 
     #[cfg(target_os = "android")]
-    pub use android::{android_init, signing_cert, widevine_id, Widevine};
+    pub use android::{android_id, android_init, android_root, android_select_root, signing_cert, widevine_id, widevine_root, Widevine};
 
     // NEEDS ON-DEVICE TEST: this path only compiles under an android target and only runs on a device — it has NOT been executed. JNI calls target jni 0.21. The app `Context` is fetched via `ActivityThread.currentApplication()` so no Java-side change is needed; the only thing the app must do is hand tohu the JavaVM once via [`android_init`] (from its `JNI_OnLoad`). Build the APK to compile-verify before relying on it.
     #[cfg(target_os = "android")]
@@ -1007,13 +1023,43 @@ pub mod device {
         use std::vec::Vec;
 
         static VM: OnceLock<JavaVM> = OnceLock::new();
+        static ROOT: OnceLock<super::AndroidRoot> = OnceLock::new();
 
         /// Hand tohu the `JavaVM` once at startup (call from the app's `JNI_OnLoad`, where the vm is handed to you). Required for [`super::machine_fingerprint`] on Android — the app `Context` is then resolved internally via `ActivityThread.currentApplication()`. First call wins.
         pub fn android_init(vm: JavaVM) {
             let _ = VM.set(vm);
         }
 
+        /// Choose the root once, before any derivation: the app looks for its device vault under each candidate and keeps the one that opens it (a fresh device gets Widevine).
+        /// First call wins, so every later `device_secret()` in the process, the session capsules included, follows the same choice.
+        pub fn android_select_root(root: super::AndroidRoot) {
+            let _ = ROOT.set(root);
+        }
+
+        /// The root selected for this process, if the app has chosen yet.
+        pub fn android_root() -> Option<super::AndroidRoot> {
+            ROOT.get().copied()
+        }
+
+        pub(super) fn selected_root() -> io::Result<super::AndroidRoot> {
+            ROOT.get().copied().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "tohu::device::android_select_root must be called before machine_fingerprint on Android",
+                )
+            })
+        }
+
+        /// The Widevine root: `deviceUniqueId` ‖ the APK signing certificate's DER, so the plate is one value across the app family and another for anyone else's build.
+        /// The error is an error: a transient CDM failure must never flip a device onto a different root, so nothing here falls back.
+        pub fn widevine_root() -> io::Result<Vec<u8>> {
+            let mut root = widevine_id()?.device_unique_id;
+            root.extend_from_slice(&signing_cert()?);
+            Ok(root)
+        }
+
         /// `Settings.Secure.getString(ActivityThread.currentApplication().getContentResolver(), "android_id")`.
+        /// The legacy root: per (device, user, signing key), 64 bits, and reset by a factory wipe. ANDROID ROOT CONVERSION PIN, delete at v168.
         pub fn android_id() -> io::Result<Vec<u8>> {
             let mut env = attach()?;
             let app = app_context(&mut env)?;

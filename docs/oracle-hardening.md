@@ -81,7 +81,7 @@ So macOS stays as it is. It is the strongest of today's oracles, and Apple offer
 | Source | Verdict |
 |---|---|
 | Widevine `MediaDrm` `PROPERTY_DEVICE_UNIQUE_ID` | **Verified 2026-11-02 on a Pixel 8 Pro.** Read with no permission, rooted in the device's Widevine credential (L1, TEE-backed on Pixel), no Google server involved in reading it: the read works in airplane mode. 32 bytes, and byte-identical across a factory reset, which `ANDROID_ID` is not. Still to verify: its scoping per app. It is a reported value as read by the app. |
-| `ANDROID_ID` (current) | Resets on factory reset. |
+| `ANDROID_ID` (the root until v139) | Resets on factory reset. Kept selectable under the ANDROID ROOT CONVERSION PIN (delete at v168) for vaults founded under it. |
 | Build serial, IMEI | Need `READ_PRIVILEGED_PHONE_STATE` since Android 10. Unavailable to apps. |
 | Keystore / KeyMint key attestation | Every key is generated and then stored (keystore database), and verification chains to Google's roots. Fails rule 1, and was already rejected as a Google dependency. |
 
@@ -99,11 +99,11 @@ Android has nothing like the TPM's deterministic primaries: KeyMint never derive
    - goes in as a separate **plate** beside the unchanged `device_secret` (published to the fleet and FGTW, checked for consistency, no migration); or
    - becomes a versioned `v1` oracle with a planned migration.
 
-   The plate is the safe first step. Which to do is the owner's decision.
+   Decided for Android 2026-11-02: the source is swapped under the unchanged v0 derivation, the old source stays selectable under a conversion pin for thirty versions (until v168), and a vault founded under the old root keeps it until converted. Desktop keeps `machine-id`, `MachineGuid` and `IOPlatformUUID`; the TPM work below would follow the same shape.
 
 ## Recommended direction
 
-1. **Android:** probe Widevine on the Pixel (below). If it survives a factory reset and is shared by our signing key, add it as the Android plate.
+1. **Android: DONE 2026-11-02, as the root, not a plate** (Nick: "we just found the ira"). `device::machine_fingerprint()` is the Widevine ID ‖ the APK signing certificate. The app selects the root once at start by which device vault is on disk (`kete::device_vault_present`): a vault under the Widevine root, or none at all, selects Widevine; only a vault under the old `ANDROID_ID` root keeps the legacy root and logs that a conversion is owed. The conversion itself (re-key the vault, carry the fleet membership from the old device key to the new) is the next step; the pin that keeps the legacy root selectable is deleted at v168.
 2. **Linux and Windows:** add a TPM plate built from the EK public key (deterministic primary, flushed, nothing stored), reported first. That alone ends reinstall and `machine-id` sybils for unmodified clients.
 3. **Then the answered form:** the deterministic HMAC primary with AK certification. That is PIPE behind the existing `tohu::pipe` / `attest` seam, with `HealthState.hardware` reporting true on a real TPM. This is the step that defeats modified clients and VM farms. It needs the verifier side (FGTW or the fleet) to check credential activation and the EK certificate chain.
 4. **macOS:** no change.
