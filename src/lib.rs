@@ -933,17 +933,42 @@ pub mod device {
     /// Every other platform answers `None`: there the only stable fact is the root itself, and publishing its hash would publish the device secret.
     /// Read fresh each call and never stored; the Linux read asks the chip, which takes up to a second, so callers run it off the UI thread.
     pub fn plate() -> Option<[u8; 32]> {
+        plate_with_source().0
+    }
+
+    /// What this device's root and plate come from: the device's own statement of its hardware, which a reader turns into an assurance level. A statement, never a proof.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum PlateSource {
+        /// No plate; the root is a file any local code can read (`machine-id`, `MachineGuid`, `hostid`).
+        File,
+        /// No plate; the root is a firmware fact any local code can read (`IOPlatformUUID`).
+        Firmware,
+        /// The Widevine plate with a per-signer key.
+        Widevine,
+        /// The TPM endorsement key as the plate, with the HMAC primary as the key.
+        Tpm,
+    }
+
+    /// [`plate`] with its source. Linux is `Tpm` only when the chip answered; a machine without one, or whose user cannot open it, is `File` like any other.
+    pub fn plate_with_source() -> (Option<[u8; 32]>, PlateSource) {
         #[cfg(target_os = "android")]
         {
-            android_plate().ok()
+            (android_plate().ok(), PlateSource::Widevine)
         }
         #[cfg(target_os = "linux")]
         {
-            tpm_plate().ok()
+            match tpm_plate() {
+                Ok(p) => (Some(p), PlateSource::Tpm),
+                Err(_) => (None, PlateSource::File),
+            }
         }
-        #[cfg(not(any(target_os = "android", target_os = "linux")))]
+        #[cfg(target_os = "macos")]
         {
-            None
+            (None, PlateSource::Firmware)
+        }
+        #[cfg(not(any(target_os = "android", target_os = "linux", target_os = "macos")))]
+        {
+            (None, PlateSource::File)
         }
     }
 
