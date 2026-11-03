@@ -87,6 +87,20 @@ So macOS stays as it is. It is the strongest of today's oracles, and Apple offer
 
 Android has nothing like the TPM's deterministic primaries: KeyMint never derives a key without storing it. Widevine is as hard as an Android app can bind without storage.
 
+## Assurance levels
+
+Beside its plate a device states what the plate names (`fgtw::fleet::plate`), and a reader derives a level from it, by what an attacker needs to become the device:
+
+| level | kind | root | to clone the device |
+|---|---|---|---|
+| 0 | file | `machine-id`, `MachineGuid` | any local code, or a disk image |
+| 1 | firmware | `IOPlatformUUID` | any local code |
+| 2 | scoped | Widevine ‖ certificate ‖ `ANDROID_ID` | root, or the app's signing key |
+| 3 | silicon key | TPM HMAC primary | the box itself |
+| 4 | answered | PIPE, or a TPM with certification | the chip itself, and a verifier can tell |
+
+Levels 0 to 3 are the device's own statement; a modified client can state any of them. Only the answered form, a proof carried beside a PIPE plate, makes level 4 more than a statement, and nothing a stated level unlocks may exceed what a proven one would. Photon shows each device's level on the Fleet page as stated (2026-11-02); a fleet-key floor by level and a threshold proof shown to friends are later work.
+
 ## Gaps
 
 1. **TPM access on Linux.** `/dev/tpmrm0` is `root:tss` mode 0660 (Fedora's `60-tpm-udev.rules`), and a normal user is not in `tss`. The installer would have to add the user to `tss` once (`usermod -aG tss`, needs root once), or ship a udev rule granting the active seat. Without it the app cannot reach the TPM and falls back to `machine-id`.
