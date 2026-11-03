@@ -966,7 +966,15 @@ pub mod device {
         {
             (None, PlateSource::Firmware)
         }
-        #[cfg(not(any(target_os = "android", target_os = "linux", target_os = "macos")))]
+        #[cfg(target_os = "windows")]
+        {
+            // TBS needs no elevation, so the chip answers for an ordinary user, or Windows has put an authorization on the endorsement hierarchy and it does not.
+            match tpm_plate() {
+                Ok(p) => (Some(p), PlateSource::Tpm),
+                Err(_) => (None, PlateSource::File),
+            }
+        }
+        #[cfg(not(any(target_os = "android", target_os = "linux", target_os = "macos", target_os = "windows")))]
         {
             (None, PlateSource::File)
         }
@@ -979,17 +987,20 @@ pub mod device {
         std::fs::read("/etc/machine-id")
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub use tpm::{tpm_hmac, tpm_plate, tpm_root};
 
     /// The TPM 2.0 plate on Linux (docs/oracle-hardening.md): the endorsement key's public half, derived by the chip from its endorsement seed every time it is asked, so nothing is stored anywhere; hashed into 32 bytes.
     /// It survives an OS reinstall and a TPM clear, and only a firmware TPM reset or a logic board swap changes it. It is reported, not answered: a plate, not a proof.
     /// Raw TPM 2.0 commands over `/dev/tpmrm0`, the kernel's resource manager, with no C library, so the crate's "nothing here can reach the network" claim stays checkable from its dependency list.
     /// The device is `root:tss` mode 0660 on every major distribution, so the plate is absent until the user is in `tss`; absent means the machine keeps its `machine-id` posture exactly as before.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     mod tpm {
-        use std::io::{self, Read, Write};
+        use std::io;
+        #[cfg(target_os = "linux")]
+        use std::io::{Read, Write};
 
+        #[cfg(target_os = "linux")]
         const DEVICE: &str = "/dev/tpmrm0";
         const ST_SESSIONS: u16 = 0x8002;
         const ST_NO_SESSIONS: u16 = 0x8001;
@@ -1066,20 +1077,131 @@ pub mod device {
         }
 
         /// One command, one whole response (the resource manager answers a write with one read).
-        fn transact(dev: &mut std::fs::File, cmd: &[u8]) -> io::Result<Vec<u8>> {
-            dev.write_all(cmd)?;
-            let mut buf = vec![0u8; RESPONSE_CAPACITY];
-            let n = dev.read(&mut buf)?;
-            // WHY: the header is ten bytes and the chip's response code sits in it; anything shorter is a transport fault, not a TPM answer.
-            if n < 10 {
-                return Err(io::Error::other(format!("tpm: short response ({n} bytes)")));
+        /// One open path to the chip: Linux talks to the kernel's resource manager device, Windows to TBS, the base service every Windows since 8 runs for ordinary users with no elevation. Same commands, same answers.
+        struct Chip {
+            #[cfg(target_os = "linux")]
+            dev: std::fs::File,
+            #[cfg(target_os = "windows")]
+            tbs: tbs::Context,
+        }
+
+        impl Chip {
+            #[cfg(target_os = "linux")]
+            fn open() -> io::Result<Chip> {
+                Ok(Chip { dev: std::fs::OpenOptions::new().read(true).write(true).open(DEVICE)? })
             }
-            buf.truncate(n);
-            let rc = u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]);
-            if rc != 0 {
-                return Err(io::Error::other(format!("tpm: response code {rc:#010x}")));
+
+            #[cfg(target_os = "windows")]
+            fn open() -> io::Result<Chip> {
+                Ok(Chip { tbs: tbs::Context::open()? })
             }
-            Ok(buf)
+
+            /// One command, one whole response; the chip's response code must be zero.
+            fn transact(&mut self, cmd: &[u8]) -> io::Result<Vec<u8>> {
+                let mut buf = vec![0u8; RESPONSE_CAPACITY];
+                #[cfg(target_os = "linux")]
+                let n = {
+                    self.dev.write_all(cmd)?;
+                    self.dev.read(&mut buf)?
+                };
+                #[cfg(target_os = "windows")]
+                let n = self.tbs.submit(cmd, &mut buf)?;
+                // WHY: the header is ten bytes and the chip's response code sits in it; anything shorter is a transport fault, not a TPM answer.
+                if n < 10 {
+                    return Err(io::Error::other(format!("tpm: short response ({n} bytes)")));
+                }
+                buf.truncate(n);
+                let rc = u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]);
+                if rc != 0 {
+                    return Err(io::Error::other(format!("tpm: response code {rc:#010x}")));
+                }
+                Ok(buf)
+            }
+        }
+
+        /// TBS, reached by loading `tbs.dll` at run time: a machine without a TPM or without the service simply has no plate, and the crate links nothing a build without the import library could miss.
+        #[cfg(target_os = "windows")]
+        mod tbs {
+            use std::io;
+
+            type Handle = *mut core::ffi::c_void;
+            #[repr(C)]
+            struct ContextParams2 {
+                version: u32,
+                flags: u32,
+            }
+            const VERSION_TWO: u32 = 2;
+            /// `includeTpm20`, bit two of the flags union.
+            const INCLUDE_TPM20: u32 = 1 << 2;
+            const LOCALITY_ZERO: u32 = 0;
+            const PRIORITY_NORMAL: u32 = 200;
+
+            type ContextCreate = unsafe extern "system" fn(*const ContextParams2, *mut Handle) -> u32;
+            type SubmitCommand = unsafe extern "system" fn(Handle, u32, u32, *const u8, u32, *mut u8, *mut u32) -> u32;
+            type ContextClose = unsafe extern "system" fn(Handle) -> u32;
+
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn LoadLibraryW(name: *const u16) -> Handle;
+                fn GetProcAddress(module: Handle, name: *const u8) -> *const core::ffi::c_void;
+            }
+
+            pub(super) struct Context {
+                handle: Handle,
+                submit: SubmitCommand,
+                close: ContextClose,
+            }
+
+            impl Context {
+                pub(super) fn open() -> io::Result<Context> {
+                    let name: Vec<u16> = "tbs.dll".encode_utf16().chain(core::iter::once(0)).collect();
+                    // SAFETY: a NUL-terminated wide string; a null module means the service is absent, reported as an error.
+                    let module = unsafe { LoadLibraryW(name.as_ptr()) };
+                    if module.is_null() {
+                        return Err(io::Error::new(io::ErrorKind::NotFound, "tpm: tbs.dll is not present"));
+                    }
+                    // SAFETY: the names are NUL-terminated byte strings and the module is live; the function types are the documented TBS signatures.
+                    let (create, submit, close) = unsafe {
+                        let create = GetProcAddress(module, b"Tbsi_Context_Create\0".as_ptr());
+                        let submit = GetProcAddress(module, b"Tbsip_Submit_Command\0".as_ptr());
+                        let close = GetProcAddress(module, b"Tbsip_Context_Close\0".as_ptr());
+                        if create.is_null() || submit.is_null() || close.is_null() {
+                            return Err(io::Error::new(io::ErrorKind::NotFound, "tpm: tbs.dll lacks the TBS entry points"));
+                        }
+                        (
+                            core::mem::transmute::<*const core::ffi::c_void, ContextCreate>(create),
+                            core::mem::transmute::<*const core::ffi::c_void, SubmitCommand>(submit),
+                            core::mem::transmute::<*const core::ffi::c_void, ContextClose>(close),
+                        )
+                    };
+                    let params = ContextParams2 { version: VERSION_TWO, flags: INCLUDE_TPM20 };
+                    let mut handle: Handle = core::ptr::null_mut();
+                    // SAFETY: the params struct matches TBS_CONTEXT_PARAMS2 and the out-pointer is valid for the call.
+                    let rc = unsafe { create(&params, &mut handle) };
+                    if rc != 0 || handle.is_null() {
+                        return Err(io::Error::other(format!("tpm: TBS context refused ({rc:#010x})")));
+                    }
+                    Ok(Context { handle, submit, close })
+                }
+
+                /// Submit one command; the answer's length is what TBS wrote into `out`.
+                pub(super) fn submit(&mut self, cmd: &[u8], out: &mut [u8]) -> io::Result<usize> {
+                    let mut len = out.len() as u32;
+                    // SAFETY: both buffers are valid for their stated lengths for the duration of the call, and `len` is in/out as documented.
+                    let rc = unsafe { (self.submit)(self.handle, LOCALITY_ZERO, PRIORITY_NORMAL, cmd.as_ptr(), cmd.len() as u32, out.as_mut_ptr(), &mut len) };
+                    if rc != 0 {
+                        return Err(io::Error::other(format!("tpm: TBS submit refused ({rc:#010x})")));
+                    }
+                    Ok(len as usize)
+                }
+            }
+
+            impl Drop for Context {
+                fn drop(&mut self) {
+                    // SAFETY: the handle came from a successful Tbsi_Context_Create and is closed once.
+                    unsafe { (self.close)(self.handle) };
+                }
+            }
         }
 
         /// The outPublic TPM2B_PUBLIC bytes (size prefix included, the form `tpm2_createek -u` writes) from a CreatePrimary response, and the transient handle to flush.
@@ -1101,11 +1223,11 @@ pub mod device {
         /// `BLAKE3` of the endorsement key's marshalled public half, created and flushed in the same breath: nothing persists in the TPM or on disk.
         /// Errors: no TPM (`NotFound`), no access (`PermissionDenied`, the user is not in `tss`), or the chip refusing the template (its response code).
         pub fn tpm_plate() -> io::Result<[u8; 32]> {
-            let mut dev = std::fs::OpenOptions::new().read(true).write(true).open(DEVICE)?;
-            let resp = transact(&mut dev, &create_primary_ek_command())?;
+            let mut chip = Chip::open()?;
+            let resp = chip.transact(&create_primary_ek_command())?;
             let (handle, public) = parse_create_primary(&resp)?;
             // The flush is owed whether or not the parse was happy; its failure is reported only if the plate itself succeeded.
-            let flushed = transact(&mut dev, &flush_context_command(handle));
+            let flushed = chip.transact(&flush_context_command(handle));
             flushed?;
             Ok(*blake3::hash(&public).as_bytes())
         }
@@ -1194,11 +1316,11 @@ pub mod device {
             if message.len() > 1 << 10 {
                 return Err(io::Error::other("tpm: HMAC message longer than one TPM buffer"));
             }
-            let mut dev = std::fs::OpenOptions::new().read(true).write(true).open(DEVICE)?;
-            let resp = transact(&mut dev, &create_primary_hmac_command())?;
+            let mut chip = Chip::open()?;
+            let resp = chip.transact(&create_primary_hmac_command())?;
             let (handle, _) = parse_create_primary(&resp)?;
-            let answer = transact(&mut dev, &hmac_command(handle, message)).and_then(|r| parse_hmac(&r));
-            let flushed = transact(&mut dev, &flush_context_command(handle));
+            let answer = chip.transact(&hmac_command(handle, message)).and_then(|r| parse_hmac(&r));
+            let flushed = chip.transact(&flush_context_command(handle));
             let tag = answer?;
             flushed?;
             Ok(tag)
