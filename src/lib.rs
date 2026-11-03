@@ -1452,7 +1452,7 @@ pub mod device {
 
     /// Android: the root the app selected with [`android_select_root`], read fresh each call.
     /// Widevine's device ID ‖ the APK signing certificate ‖ `ANDROID_ID` is the key root (Nick 2026-11-02); the first two name the phone for good ([`android_plate`]), the third keeps the key secret from other apps and rotates it on a wipe.
-    /// ANDROID ROOT CONVERSION PIN, delete not before 2027-02-01: a vault founded under the `ANDROID_ID` root keeps that root until converted, so the legacy source stays selectable for thirty versions after v138.
+    /// ANDROID ROOT CONVERSION PIN, MIGRATION-EXPIRES: 2027-02-01: a vault founded under the `ANDROID_ID` root keeps that root until converted, so the legacy source stays selectable for thirty versions after v138.
     #[cfg(target_os = "android")]
     pub fn machine_fingerprint() -> io::Result<Vec<u8>> {
         match android::selected_root()? {
@@ -1467,7 +1467,7 @@ pub mod device {
     pub enum AndroidRoot {
         /// Widevine `deviceUniqueId` ‖ APK signing certificate ‖ `ANDROID_ID`: the plate part names the phone thru a wipe, the `ANDROID_ID` part keeps the key per signer and rotates it on a wipe.
         Widevine,
-        /// `Settings.Secure.ANDROID_ID`: the root every Android vault was founded under before v139. Conversion pin, delete not before 2027-02-01.
+        /// `Settings.Secure.ANDROID_ID`: the root every Android vault was founded under before v139. Conversion pin, MIGRATION-EXPIRES: 2027-02-01.
         LegacyAndroidId,
     }
 
@@ -1536,7 +1536,7 @@ pub mod device {
         }
 
         /// `Settings.Secure.getString(ActivityThread.currentApplication().getContentResolver(), "android_id")`.
-        /// The legacy root: per (device, user, signing key), 64 bits, and reset by a factory wipe. ANDROID ROOT CONVERSION PIN, delete not before 2027-02-01.
+        /// The legacy root: per (device, user, signing key), 64 bits, and reset by a factory wipe. ANDROID ROOT CONVERSION PIN, MIGRATION-EXPIRES: 2027-02-01.
         pub fn android_id() -> io::Result<Vec<u8>> {
             let mut env = attach()?;
             let app = app_context(&mut env)?;
