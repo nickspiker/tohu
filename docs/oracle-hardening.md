@@ -81,7 +81,7 @@ So macOS stays as it is. It is the strongest of today's oracles, and Apple offer
 | Source | Verdict |
 |---|---|
 | Widevine `MediaDrm` `PROPERTY_DEVICE_UNIQUE_ID` | **Verified 2026-11-02 on a Pixel 8 Pro.** Read with no permission, rooted in the device's Widevine credential (L1, TEE-backed on Pixel), no Google server involved in reading it: the read works in airplane mode. 32 bytes, and byte-identical across a factory reset, which `ANDROID_ID` is not. Readable by every app on the phone (not scoped per signer), so it is the PLATE, `BLAKE3(id ‖ signing certificate)`, and the KEY root folds `ANDROID_ID` in as well: `id ‖ certificate ‖ ANDROID_ID`, secret from other apps and rotated by a wipe. A reported value as read by the app. |
-| `ANDROID_ID` (the root until v139) | Resets on factory reset. Kept selectable under the ANDROID ROOT CONVERSION PIN (delete at v168) for vaults founded under it. |
+| `ANDROID_ID` (the root until v139) | Resets on factory reset. Kept selectable under the ANDROID ROOT CONVERSION PIN (delete not before 2027-02-01) for vaults founded under it. |
 | Build serial, IMEI | Need `READ_PRIVILEGED_PHONE_STATE` since Android 10. Unavailable to apps. |
 | Keystore / KeyMint key attestation | Every key is generated and then stored (keystore database), and verification chains to Google's roots. Fails rule 1, and was already rejected as a Google dependency. |
 
