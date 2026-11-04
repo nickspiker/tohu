@@ -229,7 +229,7 @@ pub fn session() -> Option<SessionIdentity> {
         return None;
     }
     // Desktop: the raw 96 bytes in the XDG_RUNTIME_DIR tmpfs, which already dies at logout/reboot.
-    let bytes = std::fs::read(session_path()?).ok()?;
+    let bytes = read_private(&session_dir(false)?.join(SESSION_FILE)).ok()?;
     if bytes.len() != 96 {
         return None;
     }
@@ -243,7 +243,6 @@ pub fn session() -> Option<SessionIdentity> {
 /// Remember the session identity (RAM, `0600` on unix, gone at logout). Overwrites any prior value. Writes the three roots as 96 raw bytes — no handle string.
 #[cfg(feature = "std")]
 pub fn set_session(s: &SessionIdentity) -> std::io::Result<()> {
-    use std::io::Write;
     // Android (session dirs set): seal the boot-locked capsule and write it to every local file tier — the primary (filesDir) is authoritative and must succeed; the shadow is best-effort.
     if let Some(paths) = session_capsule_paths() {
         let cap = seal_session(s, SealMode::Local).ok_or_else(|| {
@@ -272,23 +271,14 @@ pub fn set_session(s: &SessionIdentity) -> std::io::Result<()> {
         }
         return Ok(());
     }
-    // Desktop: the raw 96 bytes to the XDG_RUNTIME_DIR tmpfs.
-    let path = session_path()
+    // Desktop: the raw 96 bytes into the session dir, by the private writer (temp name, O_NOFOLLOW, 0600 forced, rename).
+    let dir = session_dir(true)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no session runtime dir"))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(&path)?;
-    f.write_all(&s.identity_seed)?;
-    f.write_all(&s.vault_seed)?;
-    f.write_all(&s.handle_proof)
+    let mut raw = Vec::with_capacity(96);
+    raw.extend_from_slice(&s.identity_seed);
+    raw.extend_from_slice(&s.vault_seed);
+    raw.extend_from_slice(&s.handle_proof);
+    write_private(&dir.join(SESSION_FILE), &raw)
 }
 
 /// Forget the session identity (logout / drop). The runtime dir is wiped by the OS at logout regardless.
@@ -301,7 +291,7 @@ pub fn clear_session() {
         }
         return;
     }
-    if let Some(p) = session_path() {
+    if let Some(p) = session_dir(false).map(|d| d.join(SESSION_FILE)) {
         let _ = std::fs::remove_file(p);
     }
 }
@@ -322,23 +312,42 @@ pub fn handle_slot_id() -> std::io::Result<String> {
     Ok(vault_path_name("tohu", &handle_seed("handle"), &device))
 }
 
+/// The raw session file's name inside [`session_dir`].
 #[cfg(feature = "std")]
-fn session_path() -> Option<std::path::PathBuf> {
+const SESSION_FILE: &str = "session";
+
+/// The directory the raw session file lives in: `$XDG_RUNTIME_DIR/tohu` (the per-login tmpfs, `0700` and ours by logind's contract), else a private `tohu-<uid>` directory under the shared temp dir that this process creates `0700` and refuses to use unless it is exactly that — see [`private_dir`] (security audit LIB-08). The uid comes from the kernel, not `$USER`, which the environment can set to anything.
+/// `create` makes the directory for a write; a read with no directory is simply no session.
+#[cfg(feature = "std")]
+fn session_dir(create: bool) -> Option<std::path::PathBuf> {
     use std::path::PathBuf;
     // ferros keeps no session file: there is no filesystem, and the session will live in the vault (STD-TARGET.md in the ferros repo).
     if cfg!(target_os = "ferros") {
         return None;
     }
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| {
-            let user = std::env::var("USER")
-                .or_else(|_| std::env::var("USERNAME"))
-                .unwrap_or_else(|_| String::from("user"));
-            std::env::temp_dir().join(format!("tohu-{user}"))
-        });
-    Some(base.join("tohu").join("session"))
+    if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|p| !p.as_os_str().is_empty()) {
+        let dir = xdg.join("tohu");
+        if create {
+            std::fs::create_dir_all(&dir).ok()?;
+        }
+        return Some(dir);
+    }
+    let dir = std::env::temp_dir().join(format!("tohu-{}", owner_tag()));
+    private_dir(&dir, create).ok()?;
+    Some(dir)
+}
+
+/// What names our private temp-dir fallback: the real uid on unix (the kernel's word, like `/run/user/<uid>`), the login name elsewhere.
+#[cfg(feature = "std")]
+fn owner_tag() -> String {
+    #[cfg(unix)]
+    {
+        unsafe { libc::getuid() }.to_string()
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::var("USERNAME").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| String::from("user"))
+    }
 }
 
 // ============================================================================ Reboot-surviving capsule (UNATTENDED MODE ONLY) ==========================
@@ -553,18 +562,88 @@ fn session_capsule_paths() -> Option<Vec<std::path::PathBuf>> {
     None
 }
 
-/// Write `bytes` to `path`, truncating, `0600` on unix.
-#[cfg(feature = "std")]
+/// Write `bytes` to `path` as a fresh `0600` file of ours (unix): the bytes go to a sibling temp name opened `O_NOFOLLOW | O_CREAT | O_EXCL`, the mode is forced to `0600` after the open (umask or not, create or not), and the temp is renamed over `path` — so a symlink or a pre-made world-readable file planted at either name is replaced, never followed or truncated, and no reader sees a half-written file (security audit LIB-08).
+#[cfg(all(unix, feature = "std"))]
 fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
+    let mut tmp_name = name.to_os_string();
+    tmp_name.push(format!(".{}.tmp", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+    // A stale temp from a write this process never finished; remove_file unlinks a symlink itself, never its target.
+    let _ = std::fs::remove_file(&tmp);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&tmp)?;
+    let done = f
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .and_then(|_| f.write_all(bytes))
+        .and_then(|_| std::fs::rename(&tmp, path));
+    if done.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    opts.open(path)?.write_all(bytes)
+    done
+}
+
+/// Write `bytes` to `path`, truncating (non-unix: no symlink or mode contract to enforce; each platform's native session store replaces this).
+#[cfg(all(not(unix), feature = "std"))]
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(path)?.write_all(bytes)
+}
+
+/// Read `path` without following a symlink at it (unix), so a link planted at the session name can never make us read another file as our session (security audit LIB-08).
+#[cfg(all(unix, feature = "std"))]
+fn read_private(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path)?;
+    let mut out = Vec::new();
+    f.read_to_end(&mut out)?;
+    Ok(out)
+}
+
+#[cfg(all(not(unix), feature = "std"))]
+fn read_private(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    std::fs::read(path)
+}
+
+/// Create `dir` as a `0700` directory of ours, or accept an existing one only when it is exactly that: a real directory (a symlink is refused), owned by our uid, mode `0700`. Anything else is refused — a co-resident user who pre-created the name in the shared temp dir must never have our session written into a directory they can read, nor plant a session for us to trust (security audit LIB-08).
+/// `create` makes the directory when it is missing; without it a missing directory is `NotFound`.
+#[cfg(all(unix, feature = "std"))]
+fn private_dir(dir: &std::path::Path, create: bool) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    if create {
+        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let meta = std::fs::symlink_metadata(dir)?;
+    // The three facts that make the directory ours alone: not a link (symlink_metadata sees the link itself), our uid, and no bit granted to group or other.
+    let ours = meta.is_dir() && meta.uid() == unsafe { libc::getuid() } && meta.mode() & 0o777 == 0o700;
+    if !ours {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "session dir exists and is not a private 0700 directory of ours"));
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), feature = "std"))]
+fn private_dir(dir: &std::path::Path, create: bool) -> std::io::Result<()> {
+    if create {
+        std::fs::create_dir_all(dir)
+    } else if dir.is_dir() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no session dir"))
+    }
 }
 
 /// The per-boot secret: the override if one was set, else the trimmed `/proc/sys/kernel/random/boot_id` UUID string bytes (fed straight into the derivation — it is a KDF input, no hex-parse needed).
@@ -736,6 +815,52 @@ fn open_session_with_key(bytes: &[u8], mode: SealMode, key: &[u8; 32]) -> Option
 mod capsule_tests {
     use super::*;
 
+
+    /// Security audit LIB-08: the temp-dir fallback is a 0700 directory of ours or nothing — a pre-made open or zero-permission directory, a symlink, or a planted symlink at the session name is refused or replaced, never written into or followed.
+    #[cfg(unix)]
+    #[test]
+    fn fallback_session_dir_is_private_or_refused() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        let base = std::env::temp_dir().join(format!("tohu-lib08-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // A missing directory is created 0700, and then accepted again without create.
+        let fresh = base.join("fresh");
+        assert!(private_dir(&fresh, false).is_err(), "missing dir is not a session");
+        private_dir(&fresh, true).unwrap();
+        assert_eq!(std::fs::metadata(&fresh).unwrap().mode() & 0o777, 0o700);
+        private_dir(&fresh, false).unwrap();
+        // A pre-made world-open directory and a zero-permission one are refused, create or not.
+        for (name, mode) in [("open", 0o777), ("zero", 0o000)] {
+            let d = base.join(name);
+            std::fs::create_dir(&d).unwrap();
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(private_dir(&d, true).is_err(), "{name} dir accepted");
+            assert!(private_dir(&d, false).is_err(), "{name} dir accepted on read");
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        // A symlink to a perfectly good 0700 directory is still refused.
+        let link = base.join("link");
+        symlink(&fresh, &link).unwrap();
+        assert!(private_dir(&link, true).is_err());
+        assert!(private_dir(&link, false).is_err());
+        // A symlink planted at the session name is replaced, its target untouched, and the result is a 0600 regular file we can read back without following anything.
+        let victim = base.join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let session = fresh.join(SESSION_FILE);
+        symlink(&victim, &session).unwrap();
+        assert!(read_private(&session).is_err(), "a link at the session name must not be read");
+        write_private(&session, b"new").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        let meta = std::fs::symlink_metadata(&session).unwrap();
+        assert!(meta.is_file() && meta.mode() & 0o777 == 0o600);
+        assert_eq!(read_private(&session).unwrap(), b"new");
+        // Overwriting goes through the same path and leaves no temp behind.
+        write_private(&session, b"newer").unwrap();
+        assert_eq!(read_private(&session).unwrap(), b"newer");
+        assert_eq!(std::fs::read_dir(&fresh).unwrap().count(), 1);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
     #[test]
     fn a_miss_says_whether_the_device_restarted() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
