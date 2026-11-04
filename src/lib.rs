@@ -200,6 +200,18 @@ pub fn session() -> Option<SessionIdentity> {
                 present.get_or_insert_with(|| p.clone());
             }
         }
+        // MIGRATION-EXPIRES: 2027-02-01 — a Local capsule an earlier build sealed under the boot secret ALONE (before device_secret joined the key on 2026-11-03) opens once and is re-sealed under the current key, so that update costs nobody a re-attest; a reboot kills it like any other capsule.
+        if let Some(boot) = boot_secret() {
+            for p in &paths {
+                if let Ok(bytes) = std::fs::read(p) {
+                    if let Some(s) = open_session_boot_only(&bytes, &boot) {
+                        let _ = set_session(&s);
+                        *LAST_MISS.lock().unwrap() = None;
+                        return Some(s);
+                    }
+                }
+            }
+        }
         // A capsule an earlier build sealed under the LEGACY boot secret (set_boot_secret_legacy) opens once and is re-sealed under the current secret on the spot, so moving the boot-secret source costs nobody a re-attest. A real reboot changes the legacy value too, so this never reopens a capsule across a power cycle.
         if let Some(legacy) = BOOT_SECRET_LEGACY.lock().unwrap().clone() {
             for p in &paths {
@@ -419,9 +431,10 @@ const REBOOT_CAPSULE_MAGIC: &[u8; 8] = b"TOHUREB2";
 // The capsule is inert boot-locked ciphertext, so photon can write it to every storage tier (app-private for restart, sticky broadcast / SAF for reinstall) and just try each on launch; the crypto, not the storage location, enforces "dies on reboot".
 // See photon's docs/android-session-persistence.md for the tier list and flows; this module owns only the capsule crypto and the wairua.
 
-/// Which secret the *wairua* binds to.
-/// `Local` (filesDir, external shadow) is sandbox/FBE-protected, so the public `boot_id` alone is enough.
-/// `Shared` (sticky broadcast, SAF) can outlive the app and be more exposed, so it folds in `device_secret` (the app-private ANDROID_ID root) and carries a `device_secret` MAC — a leaked capsule then can't be opened or forged without the device.
+/// Which tier the capsule is written to; both seal under the boot secret AND `device_secret`.
+/// `Local` (filesDir, external shadow, macOS Application Support) once sealed under the public `boot_id` alone on the argument that the sandbox protects the file; but the boot id is written to journald and the unified log, so a disk image plus its logs rebuilt the key (security audit LIB-09, fixed 2026-11-03).
+/// With `device_secret` in the mix the image attacker needs the device root too: on Android the Widevine root only the live TEE hands over, on Linux the machine root, on macOS the hardware fingerprint, which narrows rather than closes it there until a Mac plate exists.
+/// `Shared` (sticky broadcast, SAF) can outlive the app and be more exposed, so it also carries a `device_secret` MAC — a leaked capsule then can't be forged without the device.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SealMode {
     Local,
@@ -586,8 +599,8 @@ fn boot_secret() -> Option<Vec<u8>> {
 }
 
 /// The *wairua* — the per-boot key the capsule is sealed under.
-/// `ihi::spaghettify` (fast, ~ms) of a domain tag ‖ the boot secret, plus `device_secret` for `Shared`.
-/// Dies on reboot because the boot secret does; `None` if there is no boot-secret source (or, for `Shared`, no `device_secret`).
+/// `ihi::spaghettify` (fast, ~ms) of a domain tag ‖ the boot secret ‖ `device_secret`, for both modes since 2026-11-03 (LIB-09; the mode byte still names the tier).
+/// Dies on reboot because the boot secret does; `None` if there is no boot-secret source or no `device_secret`.
 #[cfg(feature = "std")]
 fn wairua(mode: SealMode) -> Option<[u8; 32]> {
     wairua_for(&boot_secret()?, mode)
@@ -595,13 +608,20 @@ fn wairua(mode: SealMode) -> Option<[u8; 32]> {
 
 /// The *wairua* under an explicit boot secret — the current one, or the legacy one a capsule from an earlier build may still be sealed under ([`set_boot_secret_legacy`]).
 #[cfg(feature = "std")]
-fn wairua_for(boot: &[u8], mode: SealMode) -> Option<[u8; 32]> {
+fn wairua_for(boot: &[u8], _mode: SealMode) -> Option<[u8; 32]> {
     let mut input = Vec::with_capacity(16 + boot.len() + 32);
     input.extend_from_slice(b"tohu-wairua-v0:");
     input.extend_from_slice(boot);
-    if mode == SealMode::Shared {
-        input.extend_from_slice(&crate::device::device_secret().ok()?);
-    }
+    input.extend_from_slice(&crate::device::device_secret().ok()?);
+    Some(ihi::spaghettify(&input))
+}
+
+/// MIGRATION-EXPIRES: 2027-02-01 — the key a `Local` capsule was sealed under before 2026-11-03, the boot secret alone, read once so that update costs nobody a re-attest; a capsule is per boot, so after that date every one of these has died with its boot anyway.
+#[cfg(feature = "std")]
+fn wairua_boot_only(boot: &[u8]) -> Option<[u8; 32]> {
+    let mut input = Vec::with_capacity(16 + boot.len());
+    input.extend_from_slice(b"tohu-wairua-v0:");
+    input.extend_from_slice(boot);
     Some(ihi::spaghettify(&input))
 }
 
@@ -655,6 +675,18 @@ pub fn open_session(bytes: &[u8], mode: SealMode) -> Option<SessionIdentity> {
 /// [`open_session`] under an explicit boot secret.
 #[cfg(feature = "std")]
 fn open_session_under(bytes: &[u8], mode: SealMode, boot: &[u8]) -> Option<SessionIdentity> {
+    open_session_with_key(bytes, mode, &wairua_for(boot, mode)?)
+}
+
+/// MIGRATION-EXPIRES: 2027-02-01 — [`open_session`] under the pre-2026-11-03 `Local` key (the boot secret alone); delete with [`wairua_boot_only`] and the loop in [`session`] that calls this.
+#[cfg(feature = "std")]
+fn open_session_boot_only(bytes: &[u8], boot: &[u8]) -> Option<SessionIdentity> {
+    open_session_with_key(bytes, SealMode::Local, &wairua_boot_only(boot)?)
+}
+
+/// [`open_session`] under an explicit *wairua*.
+#[cfg(feature = "std")]
+fn open_session_with_key(bytes: &[u8], mode: SealMode, key: &[u8; 32]) -> Option<SessionIdentity> {
     use chacha20poly1305::{
         XChaCha20Poly1305, XNonce,
         aead::{Aead, KeyInit},
@@ -688,9 +720,8 @@ fn open_session_under(bytes: &[u8], mode: SealMode, boot: &[u8]) -> Option<Sessi
         return None;
     }
     let (nonce_bytes, ct) = blob.split_at(24);
-    let key = wairua_for(boot, mode)?;
     let nonce = XNonce::try_from(nonce_bytes).ok()?;
-    let pt = XChaCha20Poly1305::new((&key).into()).decrypt(&nonce, ct).ok()?;
+    let pt = XChaCha20Poly1305::new(key.into()).decrypt(&nonce, ct).ok()?;
     if pt.len() != 96 {
         return None;
     }
