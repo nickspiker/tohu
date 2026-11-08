@@ -123,6 +123,54 @@ Levels 0 to 3 are the device's own statement; a modified client can state any of
 4. **Then the answered form:** the same HMAC primary with AK certification. That is PIPE behind the existing `tohu::pipe` / `attest` seam, with `HealthState.hardware` reporting true on a real TPM. This is the step that defeats modified clients and VM farms. It needs the verifier side (FGTW or the fleet) to check credential activation and the EK certificate chain.
 5. **macOS:** no change.
 
+## Beyond the oracle: a tag in the pocket, or the kernel
+
+Direction from the owner, 2026-11-08; nothing of it built.
+
+**The problem.** A plate source answers anyone who asks.
+On Android any app reads the Widevine ID (gap 5); the key root also mixes in `ANDROID_ID`, which is per signer, so another developer's app cannot compute ours, but root or an app signed with our key can.
+On the desktop any process of the same user reads `machine-id`, `MachineGuid` or `IOPlatformUUID`, can ask the TPM HMAC primary for the same answer (anyone in `tss`), and can read the session registers.
+The plate may be public, since it only names the device. The trust has to come from something only the owner holds.
+
+**The owner's direction:** keep binding the plate, and add a crypto tag as the trust half, PIPE carried in a pocket, domain-separated by handle; or have the kernel enforce a software PIPE.
+Both are unconventional; both are to be built and kept on record here.
+
+### A tag as PIPE
+
+PIPE's interface is 256 bits in, 256 bits out, the same answer to the same question, and a secret that never leaves the chip.
+
+- **A FIDO2 authenticator with `hmac-secret` (CTAP 2.1) fits exactly.** A 32-byte salt goes in and HMAC-SHA-256 under a per-credential secret comes out; the secret is made in the chip and never exported, the answer repeats for the same credential and salt, and the tap is the presence.
+  - One key speaks NFC to a phone and USB to a desktop. Keys are off the shelf, from many vendors, and no vendor is in the loop when one answers.
+  - Domain separation by handle: the salt is a keyed BLAKE3 of `handle_proof` under a context string, so the tag never sees the identity itself and each handle gets its own answer from one credential.
+  - A discoverable credential lets the client keep nothing at all; a non-discoverable one keeps only the credential id, which the tag wrapped and which is useless without it.
+  - The answered form: the credential's attestation certificate at creation is the vendor's, a DMV-issued value checked offline.
+- **NTAG 424 DNA is the wrong shape**, though it resists cloning.
+  - Its AES keys are symmetric, so whoever checks the tag must hold its key too, and that key would sit on our devices, the exfiltration surface rule 1 exists to avoid.
+  - Its SUN MAC is bound to a counter that advances on every read, so the answer never repeats and nothing can be derived from it.
+  - It proves a tag is genuine to a server that holds its key; it cannot stand in for PIPE.
+- **A JavaCard NFC card** (an applet holding a key generated on the card) also fits and allows an applet of our own, at the cost of writing and loading one.
+
+How it fits the rules above:
+
+- **The plate stays the device's** (rule 2): one device, one plate, published, never salted.
+- **The tag is the person's, so it joins the key half,** which on Android already sits apart from the plate. The device's trust then needs both what the device is and what its owner carries.
+- **Rule 7 holds.** `device_secret` is frozen at `v0`, so the tag does not feed it. It gates a layer above: the fleet signing key, or the vault's unlock, needs the tag's answer. The derivation and every vault stay as they are. A versioned `v1` oracle is the other path.
+- **One tap per boot,** at attest and at Locked → Live, matching "signed in until power-off". The session registers are what remains exposed while a session is live.
+- **A lost tag is recovered like a lost device:** a sibling sponsors a fresh bind with a new tag, and an identity can enroll a spare tag ahead of time.
+- **The assurance table needs a row** for a device whose key half is tag-gated.
+
+### Kernel enforcement: a software PIPE
+
+The OS refuses every process but ours access to the root:
+
+- **Linux: feasible.** First without a patch: an SELinux or AppArmor profile that lets only our signed binary open `/dev/tpmrm0` and the session directory, with Yama `ptrace_scope` at 1 or more. A small module or LSM is the stronger form. It needs root once, as the `tss` membership does (gap 1).
+- **Android: only on a kernel we flash.** No ordinary phone can take it; ferros already enforces this natively.
+- **Windows: heavy.** A kernel driver needs Microsoft's attestation signing, and an administrator can still remove it.
+- **macOS: not viable.** Third-party kernel extensions are deprecated.
+
+So the kernel route covers Linux (and ferros), and the tag route covers every phone with NFC and every desktop with USB.
+**Recommended: the tag first.**
+
 ## Verification still to do
 
 - **Linux, EK is deterministic and readable without storage: VERIFIED 2026-11-02** on an AMD fTPM (Ryzen 9 5950X) as a user in `tss`. Two `tpm2_createek -G rsa -u` runs gave identical files, and `b3sum` of that file equalled `tohu::device::tpm_plate()` run against the same chip, byte for byte: the template, the marshalling and the parse all agree with the reference tool. Caution: `tpm2_createek -c -` PERSISTS the key (it printed `persistent-handle: 0x81000000` and `0x81000003`, evicted afterwards with `tpm2_evictcontrol -C o -c <handle>`); use `-c ek.ctx` for a transient context instead. tohu's own path persists nothing (CreatePrimary then FlushContext).
@@ -137,3 +185,9 @@ Levels 0 to 3 are the device's own statement; a modified client can state any of
   - across an app reinstall;
   - across two apps signed with our key;
   - across a factory reset of a spare device (not the daily Pixel unless the owner chooses to).
+- **FIDO2 `hmac-secret`, per platform:**
+  - Android: CTAP 2 over NFC as plain ISO-DEP APDUs from the app (no Google FIDO API in the loop).
+  - Linux: `hidraw` access to the key needs a udev rule (libfido2 ships one).
+  - macOS: USB HID from an unsandboxed app.
+  - Windows: non-administrator apps reach FIDO keys only through Windows' WebAuthn API; whether it passes `hmac-secret` through to us needs checking.
+  - Everywhere: the same salt twice gives the same 32 bytes, and two handles' salts give unrelated answers.
