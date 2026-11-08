@@ -159,6 +159,13 @@ How it fits the rules above:
 - **A lost tag is recovered like a lost device:** a sibling sponsors a fresh bind with a new tag, and an identity can enroll a spare tag ahead of time.
 - **The assurance table needs a row** for a device whose key half is tag-gated.
 
+### Papers in the glovebox
+
+The owner, 2026-11-08: "leave the plate on each one, the best we can, then put the cert in the glovebox."
+The plate stays the device's public name; the **papers** are a key made inside the device's secure hardware and never exportable (StrongBox, the TPM, the Secure Enclave), registered in the fleet.
+A factory reset destroys the papers and leaves the plate claimed by its owner, so only the owner's tap brings the device back, and green on the device in hand becomes proof (photon docs/one-identity.md, "Plate and papers").
+This would overturn rule 1 for the key half: a non-exportable key is stored, but it cannot be copied, which is what the rule guards, and using it locally puts no vendor in the loop. That is the owner's ruling to make; the open points (the frozen `v0`, uninstall on Android, desktop papers that die on reinstall) are listed there.
+
 ### Kernel enforcement: a software PIPE
 
 The OS refuses every process but ours access to the root:
