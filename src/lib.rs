@@ -1137,11 +1137,58 @@ pub mod device {
     }
 
     /// The raw platform device fact (hashed into [`device_secret`]):
-    /// Linux `/etc/machine-id` · Windows registry `MachineGuid` · macOS `IOPlatformUUID` (firmware, survives reinstall) · Android Widevine `deviceUniqueId` ‖ APK signing certificate via JNI (needs [`android_init`] and [`android_select_root`]; legacy `ANDROID_ID` under the conversion pin until v168) · other: `/etc/hostid` then `/etc/hostname`.
+    /// Linux `/etc/machine-id` · Windows registry `MachineGuid` (on both, the papers instead once [`desktop_select_root`] names them) · macOS `IOPlatformUUID` (firmware, survives reinstall) · Android Widevine `deviceUniqueId` ‖ APK signing certificate via JNI (needs [`android_init`] and [`android_select_root`]; legacy `ANDROID_ID` under the conversion pin until v168) · other: `/etc/hostid` then `/etc/hostname`.
     #[cfg(target_os = "linux")]
-    pub fn machine_fingerprint() -> io::Result<Vec<u8>> {
+    pub fn machine_identity() -> io::Result<Vec<u8>> {
         std::fs::read("/etc/machine-id")
     }
+
+    /// Linux and Windows: the root the selection names ([`desktop_select_root`]); unselected, the machine identity, today's root.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub fn machine_fingerprint() -> io::Result<Vec<u8>> {
+        match desktop_root() {
+            DesktopRoot::Papers => papers_root(),
+            DesktopRoot::Legacy => machine_identity(),
+        }
+    }
+
+    /// Which root a Linux or Windows device secret comes from (photon docs/lifecycle.md, "The move to papers").
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum DesktopRoot {
+        /// The papers: the TPM's keyed-hash primary over a fixed label and the machine identity ([`papers_root`]). Only this chip can answer, and a reinstalled OS has a new machine identity, so a reset leaves the plate and takes the papers.
+        Papers,
+        /// The machine identity itself (`/etc/machine-id`, `MachineGuid`), which any local code can read: a machine without a TPM, or whose user may not open it, and every device not yet moved.
+        Legacy,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    static DESKTOP_ROOT: std::sync::OnceLock<DesktopRoot> = std::sync::OnceLock::new();
+
+    /// Name the root for this process, once, before anything derives from it; the first call wins and a later one is refused (false), so the device secret cannot change under a running process.
+    /// Never called, the root is [`DesktopRoot::Legacy`], so an app that does not take part keeps its keys.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub fn desktop_select_root(root: DesktopRoot) -> bool {
+        DESKTOP_ROOT.set(root).is_ok()
+    }
+
+    /// The root this process derives from.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub fn desktop_root() -> DesktopRoot {
+        DESKTOP_ROOT.get().copied().unwrap_or(DesktopRoot::Legacy)
+    }
+
+    /// The papers' root bytes: the chip's HMAC over [`PAPERS_LABEL`] and the machine identity. Read fresh, never stored; the chip takes up to a second.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub fn papers_root() -> io::Result<Vec<u8>> {
+        let mut message = PAPERS_LABEL.to_vec();
+        message.extend_from_slice(&machine_identity()?);
+        Ok(tpm_hmac(&message)?.to_vec())
+    }
+
+    /// What the papers' HMAC is asked, ahead of the machine identity; versioned like every context in the crate.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub const PAPERS_LABEL: &[u8] = b"tohu.device-papers.v0:";
 
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub use tpm::{tpm_hmac, tpm_plate, tpm_root};
@@ -1554,7 +1601,7 @@ pub mod device {
     }
 
     #[cfg(target_os = "windows")]
-    pub fn machine_fingerprint() -> io::Result<Vec<u8>> {
+    pub fn machine_identity() -> io::Result<Vec<u8>> {
         use std::process::Command;
         let output = Command::new("reg")
             .args([
@@ -1984,6 +2031,20 @@ mod tests {
         let path = vault_path_name("photon", &handle_seed("alice"), &[0u8; 32]);
         assert_eq!(path.len(), 43, "32 bytes base64url no-pad → 43 chars");
         assert!(path.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    }
+
+    /// The papers on real hardware (needs a TPM this user may open, so ignored by default; `cargo test --features std -- --ignored papers`): the same answer twice, apart from the machine identity and from the chip's plain key root.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    #[ignore]
+    fn papers_are_stable_and_their_own() {
+        let a = device::papers_root().expect("papers");
+        let b = device::papers_root().expect("papers again");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 32);
+        assert_ne!(a, device::machine_identity().expect("machine identity"));
+        assert_ne!(a.as_slice(), device::tpm_root().expect("tpm root").as_slice());
+        assert_eq!(device::desktop_root(), device::DesktopRoot::Legacy);
     }
 
     /// Snapshot test: if any of these fail, the v0 derivation has shifted and every existing vault on every device is now unreachable. Either revert the change or bump to v1 with a coordinated stack migration.
