@@ -243,9 +243,20 @@ pub fn session() -> Option<SessionIdentity> {
 /// Remember the session identity (RAM, `0600` on unix, gone at logout). Overwrites any prior value. Writes the three roots as 96 raw bytes — no handle string.
 #[cfg(feature = "std")]
 pub fn set_session(s: &SessionIdentity) -> std::io::Result<()> {
+    set_session_sealed(s, None)
+}
+
+/// [`set_session`] with the Android capsule sealed under `device_secret` instead of this process's own: a device moving onto a new root (photon root_conversion) seals the live session for the root it starts again on, so nobody types the handle for a key move (Nick 2026-11-08). The desktop's raw registers are not sealed, so there it is [`set_session`].
+#[cfg(feature = "std")]
+pub fn set_session_under(s: &SessionIdentity, device_secret: &[u8; 32]) -> std::io::Result<()> {
+    set_session_sealed(s, Some(device_secret))
+}
+
+#[cfg(feature = "std")]
+fn set_session_sealed(s: &SessionIdentity, under: Option<&[u8; 32]>) -> std::io::Result<()> {
     // Android (session dirs set): seal the boot-locked capsule and write it to every local file tier — the primary (filesDir) is authoritative and must succeed; the shadow is best-effort.
     if let Some(paths) = session_capsule_paths() {
-        let cap = seal_session(s, SealMode::Local).ok_or_else(|| {
+        let cap = seal_session_with(s, SealMode::Local, under).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::Other, "no wairua to seal the session")
         })?;
         let mut iter = paths.iter();
@@ -688,11 +699,17 @@ fn wairua(mode: SealMode) -> Option<[u8; 32]> {
 /// The *wairua* under an explicit boot secret — the current one, or the legacy one a capsule from an earlier build may still be sealed under ([`set_boot_secret_legacy`]).
 #[cfg(feature = "std")]
 fn wairua_for(boot: &[u8], _mode: SealMode) -> Option<[u8; 32]> {
+    Some(wairua_under(boot, &crate::device::device_secret().ok()?))
+}
+
+/// The *wairua* under an explicit device secret: this process's own ([`wairua_for`]), or the root a device is moving onto ([`set_session_under`]).
+#[cfg(feature = "std")]
+fn wairua_under(boot: &[u8], device_secret: &[u8; 32]) -> [u8; 32] {
     let mut input = Vec::with_capacity(16 + boot.len() + 32);
     input.extend_from_slice(b"tohu-wairua-v0:");
     input.extend_from_slice(boot);
-    input.extend_from_slice(&crate::device::device_secret().ok()?);
-    Some(ihi::spaghettify(&input))
+    input.extend_from_slice(device_secret);
+    ihi::spaghettify(&input)
 }
 
 /// MIGRATION-EXPIRES: 2027-02-01 — the key a `Local` capsule was sealed under before 2026-11-03, the boot secret alone, read once so that update costs nobody a re-attest; a capsule is per boot, so after that date every one of these has died with its boot anyway.
@@ -709,13 +726,22 @@ fn wairua_boot_only(boot: &[u8]) -> Option<[u8; 32]> {
 /// `None` if the *wairua* (or, for `Shared`, `device_secret`) is unavailable.
 #[cfg(feature = "std")]
 pub fn seal_session(s: &SessionIdentity, mode: SealMode) -> Option<Vec<u8>> {
+    seal_session_with(s, mode, None)
+}
+
+/// [`seal_session`] under `under`'s device secret when one is named, this process's own otherwise.
+#[cfg(feature = "std")]
+fn seal_session_with(s: &SessionIdentity, mode: SealMode, under: Option<&[u8; 32]>) -> Option<Vec<u8>> {
     use chacha20poly1305::{
         XChaCha20Poly1305, XNonce,
         aead::{Aead, KeyInit},
     };
     use rand::RngCore;
 
-    let key = wairua(mode)?;
+    let key = match under {
+        Some(ds) => wairua_under(&boot_secret()?, ds),
+        None => wairua(mode)?,
+    };
     let mut roots = [0u8; 96];
     roots[0..32].copy_from_slice(&s.identity_seed);
     roots[32..64].copy_from_slice(&s.vault_seed);
@@ -736,7 +762,10 @@ pub fn seal_session(s: &SessionIdentity, mode: SealMode) -> Option<Vec<u8>> {
     out.extend_from_slice(CAPSULE_MAGIC);
     out.push(mode as u8);
     if mode == SealMode::Shared {
-        let ds = crate::device::device_secret().ok()?;
+        let ds = match under {
+            Some(ds) => *ds,
+            None => crate::device::device_secret().ok()?,
+        };
         out.extend_from_slice(blake3::keyed_hash(&ds, &blob).as_bytes());
     }
     out.extend_from_slice(&blob);
@@ -935,6 +964,18 @@ mod capsule_tests {
         set_boot_secret_override(b"boot-A");
         let cap = seal_session(&sample(), SealMode::Shared).expect("seal");
         assert_eq!(open_session(&cap, SealMode::Shared).expect("open"), sample());
+    }
+
+    /// A key move (photon root_conversion): a capsule sealed under the root a device moves onto opens for a process running on that root, and only for it, so the move costs no handle (Nick 2026-11-08).
+    #[test]
+    fn sealed_under_a_named_root_opens_only_there() {
+        let _g = TEST_LOCK.lock().unwrap();
+        set_boot_secret_override(b"boot-A");
+        let ours = device::device_secret().expect("device secret");
+        let cap = seal_session_with(&sample(), SealMode::Local, Some(&ours)).expect("seal");
+        assert_eq!(open_session(&cap, SealMode::Local).expect("open"), sample());
+        let elsewhere = seal_session_with(&sample(), SealMode::Local, Some(&[0x5Au8; 32])).expect("seal");
+        assert!(open_session(&elsewhere, SealMode::Local).is_none());
     }
 
     #[test]
