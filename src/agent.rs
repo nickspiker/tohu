@@ -23,7 +23,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use vsf::file_format::{VsfHeader, VsfSection};
-use vsf::types::VsfType;
+use vsf::types::{Ascii, VsfType};
 use vsf::vsf_builder::VsfBuilder;
 
 /// Section name on a request document.
@@ -89,13 +89,13 @@ impl Request {
     /// Encode to a complete, provenance-hashed VSF document.
     pub fn encode(&self) -> Result<Vec<u8>, String> {
         let mut fields: Vec<(String, VsfType)> =
-            vec![(F_OP.to_string(), VsfType::a(self.op().to_string()))];
+            vec![(F_OP.to_string(), VsfType::a(Ascii::lit(self.op())))];
         match self {
             Request::Get { slot } | Request::Clear { slot } => {
-                fields.push((F_SLOT.to_string(), VsfType::a(slot.clone())));
+                fields.push((F_SLOT.to_string(), VsfType::a(Ascii::new(slot.clone()).map_err(|e| format!("{F_SLOT}: {e}"))?)));
             }
             Request::Set { slot, seed } => {
-                fields.push((F_SLOT.to_string(), VsfType::a(slot.clone())));
+                fields.push((F_SLOT.to_string(), VsfType::a(Ascii::new(slot.clone()).map_err(|e| format!("{F_SLOT}: {e}"))?)));
                 fields.push((F_SEED.to_string(), VsfType::hV(seed.to_vec())));
             }
             Request::Health => {}
@@ -143,7 +143,7 @@ impl Response {
     /// Encode to a complete, provenance-hashed VSF document.
     pub fn encode(&self) -> Result<Vec<u8>, String> {
         let mut fields: Vec<(String, VsfType)> =
-            vec![(F_OP.to_string(), VsfType::a(self.op().to_string()))];
+            vec![(F_OP.to_string(), VsfType::a(Ascii::lit(self.op())))];
         match self {
             Response::Seed(seed) => {
                 fields.push((F_SEED.to_string(), VsfType::hV(seed.to_vec())));
@@ -196,7 +196,7 @@ fn section_of(bytes: &[u8], name: &str) -> Result<VsfSection, String> {
 
 fn ascii_field(section: &VsfSection, name: &str) -> Result<String, String> {
     match section.get_field(name).and_then(|f| f.values.first()) {
-        Some(VsfType::a(s)) => Ok(s.clone()),
+        Some(VsfType::a(s)) => Ok(s.to_string()),
         _ => Err(format!("{name}: missing or not ASCII text")),
     }
 }
@@ -466,8 +466,8 @@ mod tests {
             .add_section(
                 SEC_REQ,
                 vec![
-                    (F_OP.to_string(), VsfType::a("set".to_string())),
-                    (F_SLOT.to_string(), VsfType::a(SLOT.to_string())),
+                    (F_OP.to_string(), VsfType::a(Ascii::lit("set"))),
+                    (F_SLOT.to_string(), VsfType::a(Ascii::lit(SLOT))),
                     (F_SEED.to_string(), VsfType::hV(vec![1u8; 16])),
                 ],
             )
@@ -759,7 +759,7 @@ mod tests {
             .provenance_only()
             .add_section(
                 SEC_REQ,
-                vec![(F_OP.to_string(), VsfType::a("summon".to_string()))],
+                vec![(F_OP.to_string(), VsfType::a(Ascii::lit("summon")))],
             )
             .build()
             .unwrap();
