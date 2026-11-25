@@ -1641,9 +1641,16 @@ pub mod device {
         }
     }
 
+    /// Read once a process: the MachineGuid cannot change under a running process and any local code can read it, so the cache holds nothing secret.
+    /// Every read spawned `reg.exe`, and a console window flashed for each from a GUI app (2026-11-25: 8 to 12 s of them before Photon showed on a new Windows device, papers_root reading it again on every fingerprint).
     #[cfg(target_os = "windows")]
     pub fn machine_identity() -> io::Result<Vec<u8>> {
+        use std::os::windows::process::CommandExt;
         use std::process::Command;
+        static READ: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        if let Some(id) = READ.get() {
+            return Ok(id.clone());
+        }
         let output = Command::new("reg")
             .args([
                 "query",
@@ -1651,9 +1658,18 @@ pub mod device {
                 "/v",
                 "MachineGuid",
             ])
+            .creation_flags(CREATE_NO_WINDOW)
             .output()?;
+        // Only a read that succeeded is kept: a failed one is asked again next time.
+        if output.status.success() {
+            let _ = READ.set(output.stdout.clone());
+        }
         Ok(output.stdout)
     }
+
+    /// CreateProcess's flag for a console tool run from a GUI process: no console window.
+    #[cfg(target_os = "windows")]
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     #[cfg(target_os = "macos")]
     pub fn machine_fingerprint() -> io::Result<Vec<u8>> {
